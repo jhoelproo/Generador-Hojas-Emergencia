@@ -1,4 +1,4 @@
-# Generador de Hojas de Emergencia 4.1.0
+# Generador de Hojas de Emergencia 4.1.1
 
 ## Cambios principales
 
@@ -15,6 +15,7 @@
 - La edicion ordinaria de pacientes y atenciones ya no requiere PIN y conserva una auditoria completa del operador.
 - La opcion "Impresiones y documentos pendientes" explica y recupera las etapas que fallaron sin duplicar registros.
 - Se incorpora actualizacion remota desde GitHub Releases con verificacion SHA-256 y un actualizador externo.
+- Se corrige la recuperacion de permisos de Windows para que un log con ACL danada nunca impida abrir la aplicacion.
 
 ## Actualizacion
 

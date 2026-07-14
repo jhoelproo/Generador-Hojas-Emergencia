@@ -67,7 +67,8 @@ def test_windows_acl_command_is_restricted_to_expected_principals(
 
     monkeypatch.setattr(paths.subprocess, "run", fake_run)
     assert paths.harden_windows_acl(tmp_path) is True
-    command = calls[1]
+    assert "/inheritance:e" in calls[1]
+    command = calls[2]
     assert command[:3] == ["icacls", str(tmp_path.resolve()), "/inheritance:r"]
     assert "DOMINIO\\usuario_prueba:(OI)(CI)M" in command
     assert "*S-1-5-18:(OI)(CI)F" in command

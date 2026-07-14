@@ -33,7 +33,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\packaging\build_release.ps1 -AllowUnsigned
 ```
 
-El resultado se crea en `release/GENERADOR_DE_HOJAS_4.1.0` y en su archivo ZIP. Ambos incluyen comprobaciones SHA-256.
+El resultado se crea en `release/GENERADOR_DE_HOJAS_4.1.1` y en su archivo ZIP. Ambos incluyen comprobaciones SHA-256.
 
 ## Regla de privacidad
 

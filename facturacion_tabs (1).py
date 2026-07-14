@@ -1,6 +1,6 @@
 # facturacion_tabs.py
 # Sistema de Formularios de Emergencia - Hospital General
-# Version: 4.1.0 - Integridad, turnos, auditoria y actualizacion remota
+# Version: 4.1.1 - Recuperacion de permisos y actualizacion remota
 # Python 3.14 compatible
 import os
 import re
@@ -228,12 +228,31 @@ RESUMEN_TURNO_PATH = app_data_path("resumen_turno.json")
 APP_LOG = logging.getLogger("emergencias")
 APP_LOG.setLevel(logging.INFO)
 if not APP_LOG.handlers:
-    _log_handler = RotatingFileHandler(
-        os.path.join(LOGS_DIR, "app.log"),
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
+    _log_path = os.path.join(LOGS_DIR, "app.log")
+    try:
+        _log_handler = RotatingFileHandler(
+            _log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+    except PermissionError:
+        harden_windows_acl(data_root())
+        try:
+            _log_handler = RotatingFileHandler(
+                _log_path,
+                maxBytes=5 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+        except (OSError, PermissionError):
+            _fallback_log = os.path.join(tempfile.gettempdir(), "GeneradorHojasEmergencia.log")
+            _log_handler = RotatingFileHandler(
+                _fallback_log,
+                maxBytes=2 * 1024 * 1024,
+                backupCount=2,
+                encoding="utf-8",
+            )
     _log_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     APP_LOG.addHandler(_log_handler)
 APP_LOG.propagate = False
@@ -4841,8 +4860,6 @@ class App:
                 "representantes.json",
                 "security.json",
             ))
-            if getattr(sys, "frozen", False) and not os.environ.get("EMERGENCIAS_DATA_DIR"):
-                harden_windows_acl(data_root())
         except Exception:
             APP_LOG.exception("No se pudo completar la preparacion del directorio de datos")
         self.db = DatabaseManager()

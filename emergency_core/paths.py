@@ -71,7 +71,7 @@ def migrate_legacy_files(file_names: tuple[str, ...]) -> list[tuple[Path, Path]]
 
 
 def harden_windows_acl(path: str | os.PathLike[str]) -> bool:
-    """Restrict a data folder to the current account, SYSTEM and administrators."""
+    """Repair inheritance, then restrict the data root with inheritable entries."""
     if os.name != "nt":
         return True
     identity_result = subprocess.run(
@@ -81,6 +81,14 @@ def harden_windows_acl(path: str | os.PathLike[str]) -> bool:
     if not identity:
         return False
     target = str(Path(path).resolve())
+    repair = subprocess.run(
+        ["icacls", target, "/inheritance:e", "/T", "/C", "/Q"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if repair.returncode != 0:
+        return False
     command = [
         "icacls",
         target,
@@ -89,17 +97,9 @@ def harden_windows_acl(path: str | os.PathLike[str]) -> bool:
         f"{identity}:(OI)(CI)M",
         "*S-1-5-18:(OI)(CI)F",
         "*S-1-5-32-544:(OI)(CI)F",
-        "/T",
-        "/C",
         "/Q",
     ]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode == 0:
         return True
-    subprocess.run(
-        ["icacls", target, "/inheritance:e", "/T", "/C", "/Q"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
     return False
