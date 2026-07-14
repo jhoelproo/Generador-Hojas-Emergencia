@@ -72,6 +72,17 @@ def test_daily_duplicate_identity_conflict_reentry_and_output_states(tmp_path, m
             "GENERAL",
             shift,
         )
+    conflict_ids = manager.obtener_o_registrar_conflictos_cedula(
+        "002-1234567-9",
+        "La cedula pertenece a una ficha diferente del NSS indicado.",
+    )
+    assert len(conflict_ids) == 1
+    assert manager.obtener_o_registrar_conflictos_cedula("00212345679") == conflict_ids
+    targeted = {
+        int(row["id"]): row for row in manager.listar_conflictos_identidad(True, 1000)
+    }
+    assert targeted[conflict_ids[0]]["atencion_id"] == second_id
+    assert targeted[conflict_ids[0]]["tipo"] == "CONFLICTO_CEDULA_DETECTADO"
 
     reentry_id = manager.guardar_atencion(
         patient_data(

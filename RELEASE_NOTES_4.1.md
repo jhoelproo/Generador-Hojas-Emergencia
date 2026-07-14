@@ -1,4 +1,7 @@
-# Generador de Hojas de Emergencia 4.1.2
+# Generador de Hojas de Emergencia 4.1.3
+
+- Al detectar un conflicto por cedula, la aplicacion abre la revision filtrada y selecciona el caso exacto.
+- Se retiro el boton duplicado de revision de conflictos junto al acceso de Historial.
 
 ## Cambios principales
 

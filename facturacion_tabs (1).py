@@ -1,6 +1,6 @@
 # facturacion_tabs.py
 # Sistema de Formularios de Emergencia - Hospital General
-# Version: 4.1.2 - Flujo operativo de historial e identidades
+# Version: 4.1.3 - Acceso directo al conflicto de cedula detectado
 # Python 3.14 compatible
 import os
 import re
@@ -3035,6 +3035,90 @@ class DatabaseManager:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def obtener_o_registrar_conflictos_cedula(self, cedula, detalle=""):
+        cedula_clean = re.sub(r"\D", "", str(cedula or ""))
+        if not is_valid_cedula_key(cedula_clean):
+            return []
+
+        with closing(self._connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            propietarios = [
+                int(row["paciente_id"])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT paciente_id
+                    FROM paciente_identificadores
+                    WHERE tipo='CEDULA' AND valor_normalizado=? AND activo=1
+                    ORDER BY paciente_id
+                    """,
+                    (cedula_clean,),
+                ).fetchall()
+            ]
+            if not propietarios:
+                conn.rollback()
+                return []
+
+            conflicto = conn.execute(
+                """
+                SELECT DISTINCT c.id
+                FROM identidad_conflictos c
+                LEFT JOIN atenciones a ON a.id=c.atencion_id
+                WHERE c.estado='PENDIENTE'
+                  AND c.tipo<>'POSIBLE_REINGRESO'
+                  AND (
+                    a.cedula_clean=?
+                    OR (
+                        c.atencion_id IS NULL
+                        AND c.paciente_id IN (
+                            SELECT paciente_id
+                            FROM paciente_identificadores
+                            WHERE tipo='CEDULA' AND valor_normalizado=? AND activo=1
+                        )
+                    )
+                  )
+                ORDER BY CASE WHEN c.tipo='CONFLICTO_CEDULA_DETECTADO' THEN 0 ELSE 1 END,c.id
+                LIMIT 1
+                """,
+                (cedula_clean, cedula_clean),
+            ).fetchone()
+            if conflicto:
+                conn.commit()
+                return [int(conflicto["id"])]
+
+            paciente_id = propietarios[0]
+            atencion = conn.execute(
+                """
+                SELECT id FROM atenciones
+                WHERE paciente_id=? AND cedula_clean=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (paciente_id, cedula_clean),
+            ).fetchone()
+            atencion_id = int(atencion["id"]) if atencion else None
+            mensaje = str(detalle or "").strip() or (
+                "Conflicto de cédula detectado al intentar registrar una atención."
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO identidad_conflictos(paciente_id,atencion_id,tipo,detalle)
+                VALUES (?,?,'CONFLICTO_CEDULA_DETECTADO',?)
+                """,
+                (paciente_id, atencion_id, mensaje),
+            )
+            conflicto_id = int(cursor.lastrowid)
+            conn.execute(
+                "UPDATE pacientes SET requiere_revision=1,updated_at=datetime('now','localtime') WHERE id=?",
+                (paciente_id,),
+            )
+            if atencion_id is not None:
+                conn.execute(
+                    "UPDATE atenciones SET requiere_revision=1,identidad_estado='EN_REVISION' WHERE id=?",
+                    (atencion_id,),
+                )
+            conn.commit()
+            return [conflicto_id]
+
     def _refrescar_flags_revision_conn(self, conn, paciente_ids, atencion_ids):
         for atencion_id in {int(value) for value in atencion_ids if value}:
             pendientes = int(
@@ -5099,15 +5183,6 @@ class App:
             .grid(row=0, column=0, sticky="w")
         self.boton_historial = tb.Button(title_row, text="Historial", command=self.abrir_historial, width=15, bootstyle=INFO)
         self.boton_historial.grid(row=0, column=1, sticky="e")
-        self.boton_conflictos = tb.Button(
-            title_row,
-            text="Revisar conflictos",
-            command=self.abrir_revision_identidades,
-            width=18,
-            bootstyle=WARNING,
-        )
-        self.boton_conflictos.grid(row=0, column=2, sticky="e", padx=(8, 0))
-
         sep = ttk.Separator(self.frame, orient="horizontal")
         sep.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 14))
 
@@ -8304,7 +8379,16 @@ class App:
         tree.bind("<Double-1>", lambda _event: reintentar_seleccion())
         cargar()
 
-    def abrir_revision_identidades(self):
+    def abrir_revision_identidades(self, conflicto_ids=None):
+        ids_objetivo = {
+            int(value) for value in (conflicto_ids or []) if str(value).strip().isdigit()
+        }
+        if ids_objetivo and self._ventana_activa(self.revision_identidad_win):
+            try:
+                self.revision_identidad_win.destroy()
+            except Exception:
+                pass
+            self.revision_identidad_win = None
         actor = self._actor_actual()
         win = self._crear_toplevel_estable(
             "Revisión de identidades", "1180x650", "revision_identidad_win"
@@ -8315,14 +8399,25 @@ class App:
         cont.pack(fill="both", expand=True)
         tb.Label(
             cont,
-            text="Conflictos de identidad pendientes",
+            text=(
+                "Conflicto de cédula detectado"
+                if ids_objetivo
+                else "Conflictos de identidad pendientes"
+            ),
             font=("Arial", 15, "bold"),
         ).pack(anchor="w", pady=(0, 6))
         tb.Label(
             cont,
             text=(
-                "Cada decisión queda registrada. Fusionar mueve todas las atenciones de la ficha "
-                "origen; reasignar mueve solo la atención seleccionada."
+                (
+                    "Se seleccionó el caso que impidió registrar la atención. Revise sus datos "
+                    "y aplique la resolución correspondiente."
+                )
+                if ids_objetivo
+                else (
+                    "Cada decisión queda registrada. Fusionar mueve todas las atenciones de la ficha "
+                    "origen; reasignar mueve solo la atención seleccionada."
+                )
             ),
             style="Muted.TLabel",
             wraplength=1100,
@@ -8352,6 +8447,8 @@ class App:
                 tree.delete(item)
             for row in self.db.listar_conflictos_identidad(True, 1000):
                 cid = int(row["id"])
+                if ids_objetivo and cid not in ids_objetivo:
+                    continue
                 registros[cid] = row
                 tree.insert(
                     "",
@@ -8367,8 +8464,21 @@ class App:
                         row.get("detalle") or "",
                     ),
                 )
+            if registros:
+                primero = str(next(iter(registros)))
+                tree.selection_set(primero)
+                tree.focus(primero)
+                tree.see(primero)
             if not registros:
-                self.set_status("No hay conflictos de identidad pendientes", "ok")
+                if ids_objetivo:
+                    self.set_status("El conflicto indicado ya no está pendiente", "warning")
+                    messagebox.showinfo(
+                        "Revisión de identidades",
+                        "El conflicto detectado ya fue resuelto o dejó de estar pendiente.",
+                        parent=win,
+                    )
+                else:
+                    self.set_status("No hay conflictos de identidad pendientes", "ok")
 
         def seleccionado():
             items = tree.selection()
@@ -8660,7 +8770,25 @@ class App:
                 self._atender_duplicado_turno(duplicado)
             else:
                 messagebox.showwarning("Atención duplicada", "No se creó otra hoja para este paciente en el turno actual.")
-        except (ConflictoIdentidadError, TurnoNoVigenteError, ValueError) as e:
+        except ConflictoIdentidadError as e:
+            APP_LOG.warning("Registro rechazado por conflicto de identidad: %s", e)
+            self.set_status(str(e), "warning")
+            datos_conflicto = locals().get("datos", {})
+            cedula_conflicto = datos_conflicto.get("Cédula", "")
+            conflicto_ids = self.db.obtener_o_registrar_conflictos_cedula(
+                cedula_conflicto,
+                str(e),
+            )
+            mensaje = str(e)
+            if conflicto_ids:
+                mensaje += "\n\nSe abrirá la revisión directamente en este conflicto."
+            messagebox.showwarning("No se guardó la atención", mensaje, parent=self.root)
+            if conflicto_ids:
+                self.root.after(
+                    50,
+                    lambda ids=tuple(conflicto_ids): self.abrir_revision_identidades(ids),
+                )
+        except (TurnoNoVigenteError, ValueError) as e:
             APP_LOG.warning("Registro rechazado: %s", e)
             self.set_status(str(e), "warning")
             messagebox.showwarning("No se guardó la atención", str(e), parent=self.root)
