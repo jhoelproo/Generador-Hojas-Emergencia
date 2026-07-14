@@ -1,4 +1,4 @@
-# Generador de Hojas de Emergencia 4.1.1
+# Generador de Hojas de Emergencia 4.1.2
 
 ## Cambios principales
 
@@ -16,6 +16,9 @@
 - La opcion "Impresiones y documentos pendientes" explica y recupera las etapas que fallaron sin duplicar registros.
 - Se incorpora actualizacion remota desde GitHub Releases con verificacion SHA-256 y un actualizador externo.
 - Se corrige la recuperacion de permisos de Windows para que un log con ACL danada nunca impida abrir la aplicacion.
+- El historial coloca el foco directamente en la busqueda al abrirse.
+- Los conflictos de identidad se abren desde la pantalla principal sin PIN y permiten buscar la ficha destino por datos del paciente.
+- Las atenciones pueden anularse sin PIN, conservando confirmacion, motivo obligatorio y auditoria del operador.
 
 ## Actualizacion
 

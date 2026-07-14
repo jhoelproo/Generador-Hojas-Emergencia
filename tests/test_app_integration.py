@@ -101,3 +101,23 @@ def test_daily_duplicate_identity_conflict_reentry_and_output_states(tmp_path, m
         "ENVIADO",
     )
     assert output["intentos"] == 1
+
+    assert manager.borrar_atencion(
+        second_id,
+        motivo="Registro duplicado de prueba",
+        usuario="OPERADOR DE PRUEBA",
+    ) is True
+    annulled = manager.obtener_atencion_por_id(second_id)
+    assert annulled["estado"] == "ANULADA"
+    assert annulled["anulada_por"] == "OPERADOR DE PRUEBA"
+    with manager._connect() as connection:
+        audit = connection.execute(
+            "SELECT accion,actor_rol,usuario FROM atenciones_auditoria "
+            "WHERE atencion_id=? ORDER BY id DESC LIMIT 1",
+            (second_id,),
+        ).fetchone()
+    assert audit == ("ANULACION", "OPERADOR", "OPERADOR DE PRUEBA")
+
+    destination_results = manager.buscar_pacientes_avanzado("PACIENTE PRUEBA UNO")
+    assert destination_results
+    assert destination_results[0]["paciente_id"] == original["paciente_id"]

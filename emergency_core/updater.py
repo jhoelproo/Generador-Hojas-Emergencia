@@ -10,7 +10,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-APP_VERSION = "4.1.1"
+APP_VERSION = "4.1.2"
 GITHUB_REPOSITORY = "jhoelproo/Generador-Hojas-Emergencia"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASE_ARCHIVE_PATTERN = re.compile(r"^GENERADOR_DE_HOJAS_(\d+\.\d+\.\d+)\.zip$", re.IGNORECASE)

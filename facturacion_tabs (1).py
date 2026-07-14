@@ -1,6 +1,6 @@
 # facturacion_tabs.py
 # Sistema de Formularios de Emergencia - Hospital General
-# Version: 4.1.1 - Recuperacion de permisos y actualizacion remota
+# Version: 4.1.2 - Flujo operativo de historial e identidades
 # Python 3.14 compatible
 import os
 import re
@@ -2195,6 +2195,12 @@ class DatabaseManager:
         return documento
 
     def borrar_atencion(self, atencion_id: int, motivo="Eliminada desde el historial", usuario="") -> bool:
+        motivo = str(motivo or "").strip()
+        usuario = limpiar_nombre_representante(usuario)
+        if len(motivo) < 5:
+            raise ValueError("La anulación requiere un motivo de al menos 5 caracteres.")
+        if not usuario:
+            raise ValueError("La anulación requiere identificar al operador.")
         with closing(self._connect()) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
@@ -2225,7 +2231,7 @@ class DatabaseManager:
                     anulada_por=?, anulada_motivo=?, updated_at=datetime('now','localtime')
                 WHERE id=? AND estado='ACTIVA'
                 """,
-                (limpiar_nombre_representante(usuario), (motivo or "").strip(), int(atencion_id)),
+                (usuario, motivo, int(atencion_id)),
             )
             changed = cur.rowcount > 0
             after = dict(cur.execute("SELECT * FROM atenciones WHERE id=?", (atencion_id,)).fetchone())
@@ -2237,7 +2243,7 @@ class DatabaseManager:
                 usuario,
                 before,
                 after,
-                "SUPERVISOR",
+                "OPERADOR",
             )
             conn.commit()
             return changed
@@ -3156,7 +3162,7 @@ class DatabaseManager:
                     actor,
                     before,
                     after,
-                    "ADMINISTRADOR",
+                    "OPERADOR",
                 )
 
             elif resolucion == "FUSIONAR_FICHA":
@@ -3204,7 +3210,7 @@ class DatabaseManager:
                         actor,
                         dict(row),
                         after,
-                        "ADMINISTRADOR",
+                        "OPERADOR",
                     )
 
                 identificadores = conn.execute(
@@ -5018,7 +5024,7 @@ class App:
         self.actions_menu.add_command(label="Listado de Excel", command=self._abrir_excel_actual)
         self.actions_menu.add_separator()
         self.actions_menu.add_command(label="Editar paciente", command=self._abrir_edicion_paciente)
-        self.actions_menu.add_command(label="Revisar identidades", command=self.abrir_revision_identidades)
+        self.actions_menu.add_command(label="Revisar conflictos de identidad", command=self.abrir_revision_identidades)
         self.actions_menu.add_command(label="Impresiones y documentos pendientes", command=self.abrir_trabajos_salida_pendientes)
         self.actions_menu.add_command(label="Buscar actualizaciones", command=self.buscar_actualizaciones)
         self.actions_menu.add_command(label="Configuración", command=self._abrir_configuracion_interna)
@@ -5093,6 +5099,14 @@ class App:
             .grid(row=0, column=0, sticky="w")
         self.boton_historial = tb.Button(title_row, text="Historial", command=self.abrir_historial, width=15, bootstyle=INFO)
         self.boton_historial.grid(row=0, column=1, sticky="e")
+        self.boton_conflictos = tb.Button(
+            title_row,
+            text="Revisar conflictos",
+            command=self.abrir_revision_identidades,
+            width=18,
+            bootstyle=WARNING,
+        )
+        self.boton_conflictos.grid(row=0, column=2, sticky="e", padx=(8, 0))
 
         sep = ttk.Separator(self.frame, orient="horizontal")
         sep.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 14))
@@ -6444,7 +6458,7 @@ class App:
         # FASE 14: Icono uniforme 🛡
         add_action("Ver Historial sin Seguro", "🛡", self.abrir_historial_sin_seguros, WARNING)
         add_action("Editar paciente", "🖉", self._abrir_edicion_paciente, PRIMARY)
-        add_action("Revisar identidades", "?", self.abrir_revision_identidades, INFO)
+        add_action("Revisar conflictos", "?", self.abrir_revision_identidades, INFO)
         add_action("Impresiones pendientes", "!", self.abrir_trabajos_salida_pendientes, WARNING)
         add_action("Configuración interna", "⚙", self._abrir_configuracion_interna, SECONDARY)
 
@@ -8291,11 +8305,7 @@ class App:
         cargar()
 
     def abrir_revision_identidades(self):
-        actor = self._solicitar_autorizacion_admin(
-            "REVISAR_CONFLICTOS_IDENTIDAD", parent=self.root
-        )
-        if not actor:
-            return
+        actor = self._actor_actual()
         win = self._crear_toplevel_estable(
             "Revisión de identidades", "1180x650", "revision_identidad_win"
         )
@@ -8367,25 +8377,115 @@ class App:
                 return None
             return registros.get(int(items[0]))
 
+        def seleccionar_ficha_destino(paciente_origen_id=None):
+            selector = Toplevel(win)
+            selector.title("Seleccionar ficha destino")
+            selector.geometry("860x520")
+            selector.minsize(720, 440)
+            selector.transient(win)
+            selector.grab_set()
+            self._bind_esc_cerrar(selector)
+            resultado = {"paciente_id": None}
+
+            cuerpo = tb.Frame(selector, padding=14, style="Root.TFrame")
+            cuerpo.pack(fill="both", expand=True)
+            tb.Label(
+                cuerpo,
+                text="Buscar ficha que se conservará",
+                font=("Arial", 15, "bold"),
+            ).pack(anchor="w", pady=(0, 4))
+            tb.Label(
+                cuerpo,
+                text="Busque por nombre, NSS, cédula o teléfono y seleccione la ficha correcta.",
+                style="Muted.TLabel",
+            ).pack(anchor="w", pady=(0, 10))
+
+            barra = tb.Frame(cuerpo, style="Root.TFrame")
+            barra.pack(fill="x", pady=(0, 10))
+            query = tk.StringVar()
+            entry = tb.Entry(barra, textvariable=query)
+            entry.pack(side="left", fill="x", expand=True, ipady=4)
+
+            columnas_destino = ("ficha", "nombre", "nss", "cedula", "telefono")
+            destino_tree = ttk.Treeview(
+                cuerpo,
+                columns=columnas_destino,
+                show="headings",
+                style="Modern.Treeview",
+            )
+            for columna, titulo, ancho in (
+                ("ficha", "Ficha", 80),
+                ("nombre", "Nombre", 280),
+                ("nss", "NSS", 130),
+                ("cedula", "Cédula", 130),
+                ("telefono", "Teléfono", 120),
+            ):
+                destino_tree.heading(columna, text=titulo)
+                destino_tree.column(columna, width=ancho, anchor="w")
+            destino_tree.pack(fill="both", expand=True)
+
+            def buscar_destinos():
+                for item in destino_tree.get_children():
+                    destino_tree.delete(item)
+                texto = query.get().strip()
+                if not texto:
+                    return
+                for ficha in self.db.buscar_pacientes_avanzado(texto, limite=80):
+                    paciente_id = int(ficha.get("paciente_id") or 0)
+                    if not paciente_id or paciente_id == int(paciente_origen_id or 0):
+                        continue
+                    destino_tree.insert(
+                        "",
+                        "end",
+                        iid=str(paciente_id),
+                        values=(
+                            f"P:{paciente_id}",
+                            ficha.get("nombre") or "",
+                            ficha.get("nss") or "",
+                            ficha.get("cedula") or "",
+                            ficha.get("telefono") or "",
+                        ),
+                    )
+
+            def elegir_destino():
+                items = destino_tree.selection()
+                if not items:
+                    messagebox.showwarning(
+                        "Ficha destino", "Seleccione una ficha de la lista.", parent=selector
+                    )
+                    return
+                resultado["paciente_id"] = int(items[0])
+                selector.destroy()
+
+            tb.Button(
+                barra, text="Buscar", bootstyle=PRIMARY, command=buscar_destinos
+            ).pack(side="left", padx=(8, 0))
+            acciones_destino = tb.Frame(cuerpo, style="Root.TFrame")
+            acciones_destino.pack(fill="x", pady=(10, 0))
+            tb.Button(
+                acciones_destino,
+                text="Seleccionar ficha",
+                bootstyle=SUCCESS,
+                command=elegir_destino,
+            ).pack(side="left")
+            tb.Button(
+                acciones_destino, text="Cancelar", command=selector.destroy
+            ).pack(side="right")
+            entry.bind("<Return>", lambda _event: buscar_destinos())
+            destino_tree.bind("<Double-1>", lambda _event: elegir_destino())
+            selector.after(80, entry.focus_set)
+            selector.wait_window()
+            return resultado["paciente_id"]
+
         def resolver(tipo):
             row = seleccionado()
             if not row:
                 return
             destino = None
             if tipo in {"REASIGNAR_ATENCION", "FUSIONAR_FICHA"}:
-                etiqueta = "ficha destino" if tipo == "REASIGNAR_ATENCION" else "ficha que se conservará"
-                raw = simpledialog.askstring(
-                    "Ficha destino",
-                    f"Indique el ID de la {etiqueta} (por ejemplo, P:125):",
-                    parent=win,
-                )
-                if raw is None:
+                destino = seleccionar_ficha_destino(row.get("paciente_id"))
+                if destino is None:
                     return
-                raw = raw.strip().upper().removeprefix("P:")
-                if not raw.isdigit():
-                    messagebox.showwarning("Identidades", "El ID de ficha no es válido.", parent=win)
-                    return
-                destino = int(raw)
             motivo = simpledialog.askstring(
                 "Motivo de resolución",
                 "Explique la evidencia o criterio usado para esta decisión:",
@@ -8589,7 +8689,7 @@ class App:
         self._crear_header_ventana(
             cont,
             "Historial de Atenciones",
-            "Consulta registros, abre hojas PDF y elimina atenciones cuando sea necesario.",
+            "Consulta registros, abre hojas PDF y anula atenciones cuando sea necesario.",
             "📁"
         )
 
@@ -8600,6 +8700,7 @@ class App:
         self.var_bus = tk.StringVar()
         ent_bus = tb.Entry(frm_bus, textvariable=self.var_bus, width=44)
         ent_bus.pack(side="left", ipady=4)
+        win.after(80, lambda: (ent_bus.focus_set(), ent_bus.icursor("end")))
 
         filtro_rapido_var = tk.StringVar(value=self.app_settings.get("hist_default_filter", "Todos"))
         ars_filtro_var = tk.StringVar(value="(Todas)")
@@ -8941,7 +9042,7 @@ class App:
 
         tb.Button(frm_btn, text="📄  Ver PDF", bootstyle=SUCCESS, command=lambda: self.ver_pdf_seleccionado(tree)).pack(side="left", padx=4, ipady=4)
         tb.Button(frm_btn, text="🖉  Editar atención", bootstyle=SECONDARY, command=lambda: self._abrir_editor_atencion_desde_tree(tree, buscar)).pack(side="left", padx=4, ipady=4)
-        tb.Button(frm_btn, text="🗑️  Eliminar seleccionado", bootstyle=DANGER, command=lambda: self.eliminar_atencion_seleccionada(tree, reordenar_ids=True, refrescar_callback=buscar)).pack(side="left", padx=4, ipady=4)
+        tb.Button(frm_btn, text="Anular seleccionado", bootstyle=DANGER, command=lambda: self.eliminar_atencion_seleccionada(tree, reordenar_ids=True, refrescar_callback=buscar)).pack(side="left", padx=4, ipady=4)
         tb.Button(frm_btn, text="🛡  Historial sin seguros", bootstyle=WARNING, command=self.abrir_historial_sin_seguros).pack(side="left", padx=4, ipady=4)
 
         try:
@@ -9079,11 +9180,7 @@ class App:
             self._mostrar_dialogo_modal_unico("Historial", "Seleccione un registro para anular.")
             return
 
-        actor_autorizado = self._solicitar_autorizacion_admin(
-            "ANULAR_ATENCION", parent=tree.winfo_toplevel()
-        )
-        if not actor_autorizado:
-            return
+        actor_autorizado = self._actor_actual()
 
         vals = tree.item(sel[0], "values")
         atencion_id = int(vals[0])
@@ -9112,7 +9209,14 @@ class App:
         )
         if motivo is None:
             return
-        motivo = motivo.strip() or "Sin motivo especificado"
+        motivo = motivo.strip()
+        if len(motivo) < 5:
+            messagebox.showwarning(
+                "Motivo requerido",
+                "Escriba un motivo de al menos 5 caracteres para conservar la auditoría.",
+                parent=tree.winfo_toplevel(),
+            )
+            return
         turno_cfg = cargar_turno_config() or {}
         usuario = actor_autorizado or turno_cfg.get("representante", "")
 
@@ -9155,7 +9259,7 @@ class App:
         self._crear_header_ventana(
             cont,
             "Historial sin seguros",
-            "Pacientes registrados sin cobertura o sin NSS válido. Busca por nombre, consulta, abre PDF o elimina.",
+            "Pacientes registrados sin cobertura o sin NSS válido. Busca por nombre, consulta, abre PDF o anula.",
             "🛡"
         )
 
@@ -9166,6 +9270,7 @@ class App:
         var_bus = tk.StringVar()
         ent_bus = tb.Entry(frm_bus, textvariable=var_bus, width=44)
         ent_bus.pack(side="left", ipady=4)
+        win.after(80, lambda: (ent_bus.focus_set(), ent_bus.icursor("end")))
 
         btn_buscar_nombre = tb.Button(frm_bus, text="🔎  Buscar nombre", bootstyle=PRIMARY, command=lambda: None)
         btn_buscar_nombre.pack(side="left", padx=8, ipady=3)
@@ -9299,7 +9404,7 @@ class App:
         frm_btn.pack(side="bottom", fill="x", pady=(8, 0))
         tb.Button(frm_btn, text="📄  Ver PDF", bootstyle=SUCCESS, command=lambda: self.ver_pdf_seleccionado(tree)).pack(side="left", padx=4, ipady=4)
         tb.Button(frm_btn, text="🖉  Editar atención", bootstyle=SECONDARY, command=lambda: self._abrir_editor_atencion_desde_tree(tree, cargar)).pack(side="left", padx=4, ipady=4)
-        tb.Button(frm_btn, text="🗑️  Eliminar seleccionado", bootstyle=DANGER, command=lambda: self.eliminar_atencion_seleccionada(tree, reordenar_ids=False, refrescar_callback=cargar)).pack(side="left", padx=4, ipady=4)
+        tb.Button(frm_btn, text="Anular seleccionado", bootstyle=DANGER, command=lambda: self.eliminar_atencion_seleccionada(tree, reordenar_ids=False, refrescar_callback=cargar)).pack(side="left", padx=4, ipady=4)
         tb.Button(frm_btn, text="⚙ Editar paciente", bootstyle=INFO, command=lambda: self._abrir_edicion_paciente(prefill_identidad=(tree.item(tree.selection()[0], "values")[6] or tree.item(tree.selection()[0], "values")[7]) if tree.selection() else "")).pack(side="left", padx=4, ipady=4)
 
         menu_sin_seguro = tk.Menu(win, tearoff=0)
