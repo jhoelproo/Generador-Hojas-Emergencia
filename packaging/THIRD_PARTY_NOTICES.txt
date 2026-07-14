@@ -1,0 +1,37 @@
+THIRD-PARTY SOFTWARE NOTICES
+============================
+
+This application redistributes or bundles the following third-party software:
+
+- Python 3.14.3, by the Python Software Foundation and contributors.
+  License: Python Software Foundation License Version 2 and bundled notices.
+  Source: https://www.python.org/downloads/source/
+
+- SumatraPDF 3.6.1, by Krzysztof Kowalczyk and contributors.
+  License: GNU (Affero) General Public License v3, with portions under BSD terms.
+  Source: https://github.com/sumatrapdfreader/sumatrapdf/tree/3.6.1rel
+
+- ReportLab 4.4.10. BSD license.
+  Source: https://www.reportlab.com/
+
+- PyPDF2 3.0.1. BSD license.
+  Source: https://github.com/py-pdf/PyPDF2
+
+- openpyxl 3.1.5. MIT license.
+  Source: https://foss.heptapod.net/openpyxl/openpyxl
+
+- ttkbootstrap 1.20.2. MIT AND (Apache-2.0 OR BSD-2-Clause).
+  Source: https://github.com/israel-dryer/ttkbootstrap
+
+- Pillow 12.1.1. MIT-CMU license.
+  Source: https://github.com/python-pillow/Pillow
+
+- charset-normalizer 3.4.5. MIT license.
+  Source: https://github.com/jawah/charset_normalizer
+
+- et_xmlfile 2.0.0. MIT license and Python Software Foundation terms for
+  portions derived from Python standard-library code.
+  Source: https://foss.heptapod.net/openpyxl/et_xmlfile
+
+The corresponding license texts are provided in the LICENSES directory of the
+release package. These notices do not alter the licenses of the listed works.

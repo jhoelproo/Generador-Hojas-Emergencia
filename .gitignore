@@ -1,0 +1,75 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# PyInstaller and release output
+build/
+dist/
+release/
+*.toc
+*.manifest.tmp
+ENTREGA GENERADOR */
+
+# Clinical and operational data: never commit or distribute
+pacientes.db
+pacientes.db-*
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+LISTADO DE PACIENTES EN EMERGENCIA.xlsx
+*.xls
+*.xlsx
+*.csv
+ARCHIVO_DIARIO/
+BACKUPS/
+DOCUMENTOS/
+LOGS/
+REPORTES/
+debug_impresion.txt
+app_settings.json
+ars_catalogo.json
+nss_formatos_ars.json
+representantes.json
+resumen_turno.json
+security.json
+turnos_config.json
+
+# Temporary Office files and local backups
+~$*
+*.bak
+*.tmp
+*.temp
+
+# Signing material is always external to the repository
+*.p12
+*.pfx
+*.pvk
+*.key
+
+# Editors and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local QA and agent metadata
+.agents/
+.qa_runtime*/
+qa_screenshots/
+
+# Historical duplicate entry points kept only in the local backup
+test.py
+test.spec
+GENERADOR DE HOJAS 3.0.spec
+GENERADOR DE HOJAS 4.0.spec
+PYINSTALER HOJA.txt

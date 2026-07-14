@@ -1,0 +1,23 @@
+# Runtime dependencies (Python 3.14.3, Windows x64)
+charset-normalizer==3.4.5
+et_xmlfile==2.0.0
+openpyxl==3.1.5
+pillow==12.1.1
+PyPDF2==3.0.1
+reportlab==4.4.10
+ttkbootstrap==1.20.2
+
+# Reproducible build and quality toolchain
+altgraph==0.17.5
+colorama==0.4.6
+iniconfig==2.3.0
+packaging==26.0
+pefile==2024.8.26
+pluggy==1.6.0
+pygments==2.20.0
+pyinstaller==6.19.0
+pyinstaller-hooks-contrib==2026.3
+pytest==9.0.2
+pywin32-ctypes==0.2.3
+ruff==0.15.20
+setuptools==82.0.1
