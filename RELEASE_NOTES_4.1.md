@@ -1,6 +1,9 @@
-# Generador de Hojas de Emergencia 4.1.3
+# Generador de Hojas de Emergencia 4.1.6
 
-- Al detectar un conflicto por cedula, la aplicacion abre la revision filtrada y selecciona el caso exacto.
+- Al actualizar el NSS de una ficha con cedula se elimina el vinculo anterior y solo queda vigente el NSS nuevo.
+- Si un NSS sin cedula aparece con nombre y telefono diferentes, la atencion y la hoja continúan sin interrupcion.
+- Esos casos aparecen exclusivamente en Configuracion > Revision NSS para conservar, desvincular o fusionar fichas.
+- Los respaldos con mas de cuatro dias se eliminan automaticamente, incluidos formatos antiguos sin manifiesto.
 - Se retiro el boton duplicado de revision de conflictos junto al acceso de Historial.
 
 ## Cambios principales
@@ -20,7 +23,6 @@
 - Se incorpora actualizacion remota desde GitHub Releases con verificacion SHA-256 y un actualizador externo.
 - Se corrige la recuperacion de permisos de Windows para que un log con ACL danada nunca impida abrir la aplicacion.
 - El historial coloca el foco directamente en la busqueda al abrirse.
-- Los conflictos de identidad se abren desde la pantalla principal sin PIN y permiten buscar la ficha destino por datos del paciente.
 - Las atenciones pueden anularse sin PIN, conservando confirmacion, motivo obligatorio y auditoria del operador.
 
 ## Actualizacion

@@ -15,7 +15,7 @@ from typing import Any
 
 from .backup import BackupManager
 
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 14
 
 
 def _digits(value: Any) -> str:
@@ -112,9 +112,9 @@ def create_latest_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (paciente_id) REFERENCES pacientes(id) ON DELETE CASCADE,
             UNIQUE (paciente_id, tipo, valor_normalizado)
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_identificador_activo
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_cedula_activa
             ON paciente_identificadores(tipo, valor_normalizado)
-            WHERE activo=1 AND conflicto=0;
+            WHERE tipo='CEDULA' AND activo=1 AND conflicto=0;
         CREATE INDEX IF NOT EXISTS idx_pacientes_nombre ON pacientes(nombre);
         CREATE INDEX IF NOT EXISTS idx_pacientes_nss_clean ON pacientes(nss_clean);
         CREATE INDEX IF NOT EXISTS idx_pacientes_cedula_clean ON pacientes(cedula_clean);
@@ -266,6 +266,25 @@ def create_latest_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (paciente_id) REFERENCES pacientes(id) ON DELETE SET NULL,
             FOREIGN KEY (atencion_id) REFERENCES atenciones(id) ON DELETE SET NULL
         );
+        CREATE TABLE IF NOT EXISTS nss_conflictos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nss_normalizado TEXT NOT NULL,
+            paciente_nuevo_id INTEGER,
+            paciente_referencia_id INTEGER,
+            atencion_id INTEGER,
+            detalle TEXT NOT NULL,
+            estado TEXT NOT NULL DEFAULT 'PENDIENTE',
+            resolucion TEXT,
+            motivo_resolucion TEXT,
+            resuelto_por TEXT,
+            resuelto_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY (paciente_nuevo_id) REFERENCES pacientes(id) ON DELETE SET NULL,
+            FOREIGN KEY (paciente_referencia_id) REFERENCES pacientes(id) ON DELETE SET NULL,
+            FOREIGN KEY (atencion_id) REFERENCES atenciones(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_nss_conflictos_estado
+            ON nss_conflictos(estado,created_at);
         CREATE TABLE IF NOT EXISTS purga_eventos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             paciente_hash TEXT NOT NULL,
@@ -285,6 +304,44 @@ def create_latest_schema(conn: sqlite3.Connection) -> None:
             valor TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         );
+        """
+    )
+    # Versiones anteriores imponían unicidad global también al NSS.
+    conn.execute("DROP INDEX IF EXISTS uq_identificador_activo")
+
+
+def _retire_identity_conflicts(conn: sqlite3.Connection) -> None:
+    """Close the retired review queue without deleting clinical history."""
+    if not _table_exists(conn, "identidad_conflictos"):
+        return
+    conn.execute(
+        """
+        UPDATE atenciones SET identidad_estado='VALIDADA',requiere_revision=0,
+            updated_at=COALESCE(updated_at,datetime('now','localtime'))
+        WHERE id IN (
+            SELECT atencion_id FROM identidad_conflictos
+            WHERE estado='PENDIENTE' AND atencion_id IS NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE pacientes SET requiere_revision=0,
+            updated_at=COALESCE(updated_at,datetime('now','localtime'))
+        WHERE id IN (
+            SELECT paciente_id FROM identidad_conflictos
+            WHERE estado='PENDIENTE' AND paciente_id IS NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE identidad_conflictos
+        SET estado='CERRADO',resolucion=COALESCE(resolucion,'FUNCION_RETIRADA'),
+            motivo_resolucion=COALESCE(motivo_resolucion,'Cola retirada en la version 4.1.5'),
+            resuelto_por=COALESCE(resuelto_por,'SISTEMA'),
+            resuelto_at=COALESCE(resuelto_at,datetime('now','localtime'))
+        WHERE estado='PENDIENTE'
         """
     )
 
@@ -596,8 +653,10 @@ def migrate_database(db_path: str | os.PathLike[str], backup_manager: BackupMana
             create_latest_schema(conn)
             conn.commit()
         return {"created": False, "migrated": False, **validate_database(target_path)}
-    if version == 11:
-        backup_folder = backup_manager.create("antes_migracion_v11_a_v12")
+    if version in (11, 12, 13):
+        backup_folder = backup_manager.create(
+            f"antes_migracion_v{version}_a_v{LATEST_SCHEMA_VERSION}"
+        )
         with closing(sqlite3.connect(target_path)) as conn:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("BEGIN IMMEDIATE")
@@ -613,6 +672,7 @@ def migrate_database(db_path: str | os.PathLike[str], backup_manager: BackupMana
                     conn.execute(
                         f"ALTER TABLE identidad_conflictos ADD COLUMN {columna} {definicion}"
                     )
+            _retire_identity_conflicts(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_version(id,version) VALUES (1,?)",
                 (LATEST_SCHEMA_VERSION,),
@@ -624,22 +684,22 @@ def migrate_database(db_path: str | os.PathLike[str], backup_manager: BackupMana
                 """,
                 (
                     LATEST_SCHEMA_VERSION,
-                    "identity_resolution_and_audit_ledger",
+                    "nss_history_and_four_day_backups",
                     datetime.now().isoformat(timespec="seconds"),
-                    json.dumps({"from_version": 11}, sort_keys=True),
+                    json.dumps({"from_version": version}, sort_keys=True),
                 ),
             )
             conn.commit()
         result = {
             "created": False,
             "migrated": True,
-            "from_version": 11,
+            "from_version": version,
             "to_version": LATEST_SCHEMA_VERSION,
             "backup": str(backup_folder),
             **validate_database(target_path),
         }
         if logger:
-            logger.info("Migracion v11 a v12 completada: %s", result)
+            logger.info("Migracion de revision de identidades completada: %s", result)
         return result
     if not has_legacy:
         if not user_tables:
@@ -660,6 +720,7 @@ def migrate_database(db_path: str | os.PathLike[str], backup_manager: BackupMana
             target.execute("PRAGMA synchronous=FULL")
             target.execute("PRAGMA foreign_keys=ON")
             details = _copy_legacy_database(source, target)
+            _retire_identity_conflicts(target)
             target.commit()
         validation = validate_database(temp_path, attention_count)
         for suffix in ("-wal", "-shm"):

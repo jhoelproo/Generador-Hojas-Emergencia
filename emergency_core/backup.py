@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
 from contextlib import closing
@@ -41,12 +42,12 @@ class BackupManager:
         db_path: str | os.PathLike[str],
         backup_root: str | os.PathLike[str],
         related_paths: Iterable[str | os.PathLike[str]] = (),
-        retention_days: int = 45,
+        retention_days: int = 4,
     ) -> None:
         self.db_path = Path(db_path)
         self.backup_root = Path(backup_root)
         self.related_paths = tuple(Path(path) for path in related_paths)
-        self.retention_days = max(7, int(retention_days))
+        self.retention_days = max(1, int(retention_days))
         self.backup_root.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -112,6 +113,7 @@ class BackupManager:
             raise
 
     def ensure_daily(self) -> Path | None:
+        self.prune()
         today = datetime.now().date().isoformat()
         for folder in self.list_backups():
             try:
@@ -192,12 +194,37 @@ class BackupManager:
         finally:
             temp.unlink(missing_ok=True)
 
-    def prune(self) -> None:
+    def prune(self) -> int:
         cutoff = datetime.now() - timedelta(days=self.retention_days)
+        removed = 0
+        inspected = set()
         for folder in self.list_backups():
+            inspected.add(folder.resolve())
             try:
                 created = datetime.fromisoformat(str(self._manifest(folder).get("created_at", "")))
             except BackupError, ValueError:
-                continue
+                created = datetime.fromtimestamp(folder.stat().st_mtime)
             if created < cutoff:
                 shutil.rmtree(folder, ignore_errors=True)
+                removed += int(not folder.exists())
+        # Limpia también respaldos antiguos de formatos previos que no tenían manifiesto.
+        for path in self.backup_root.iterdir():
+            if path.resolve() in inspected:
+                continue
+            try:
+                stamps = re.findall(r"(20\d{6})_(\d{6})", path.name)
+                modified = (
+                    datetime.strptime("_".join(stamps[-1]), "%Y%m%d_%H%M%S")
+                    if stamps
+                    else datetime.fromtimestamp(path.stat().st_mtime)
+                )
+            except OSError:
+                continue
+            if modified >= cutoff:
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+            removed += int(not path.exists())
+        return removed

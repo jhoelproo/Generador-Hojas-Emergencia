@@ -22,6 +22,7 @@ required_paths = [
     base / "facturacion_tabs (1).py",
     base / "SumatraPDF.exe",
     base / "logo.jpg",
+    base / "istipo_hospitales.png",
     base / "Gemini_Generated_Image_o7mhooo7mhooo7mh.ico",
     base / "packaging" / "version_info.txt",
     base / "packaging" / "app.manifest",
@@ -42,6 +43,7 @@ if missing:
 
 datas = [
     (str(base / "logo.jpg"), "."),
+    (str(base / "istipo_hospitales.png"), "."),
     (str(tcl_root / "tcl8.6"), "_tcl_data"),
     (str(tcl_root / "tk8.6"), "_tk_data"),
     (str(tcl_root / "tcl8"), "tcl8"),
