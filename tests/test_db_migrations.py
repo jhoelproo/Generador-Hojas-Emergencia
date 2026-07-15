@@ -195,7 +195,7 @@ def test_identity_and_operational_time_helpers() -> None:
         parse_clinical_datetime("no", "sirve", "tampoco")
 
 
-def test_migrate_v5_preserves_ids_links_and_marks_conflicts(tmp_path: Path) -> None:
+def test_migrate_v5_preserves_ids_links_and_retires_conflicts(tmp_path: Path) -> None:
     db = tmp_path / "legacy.db"
     create_legacy_v5(db)
     manager = manager_for(db, tmp_path)
@@ -224,7 +224,7 @@ def test_migrate_v5_preserves_ids_links_and_marks_conflicts(tmp_path: Path) -> N
         assert rows[10]["dia_operativo_id"] != rows[11]["dia_operativo_id"]
         assert rows[11]["dia_operativo_id"] == rows[12]["dia_operativo_id"]
         assert rows[20]["paciente_id"] > 3
-        assert rows[20]["requiere_revision"] == 1
+        assert rows[20]["requiere_revision"] == 0
         assert rows[25]["paciente_id"] > 3
         provisional = conn.execute(
             "SELECT provisional FROM pacientes WHERE id=?", (rows[25]["paciente_id"],)
@@ -232,10 +232,10 @@ def test_migrate_v5_preserves_ids_links_and_marks_conflicts(tmp_path: Path) -> N
         assert provisional == 1
         assert conn.execute("SELECT COUNT(*) FROM trabajos_salida").fetchone()[0] == 5
         assert conn.execute("SELECT COUNT(*) FROM auditoria_tombstones").fetchone()[0] == 0
-        assert (
-            conn.execute("SELECT tipo FROM identidad_conflictos WHERE atencion_id=12").fetchone()[0]
-            == "POSIBLE_REINGRESO"
-        )
+        retired = conn.execute(
+            "SELECT tipo,estado,resolucion FROM identidad_conflictos WHERE atencion_id=12"
+        ).fetchone()
+        assert tuple(retired) == ("POSIBLE_REINGRESO", "CERRADO", "FUNCION_RETIRADA")
         audit = conn.execute("SELECT id,atencion_id FROM atenciones_auditoria ORDER BY id").fetchall()
         assert [(row[0], row[1]) for row in audit] == [(1, 10), (2, None)]
         conn.execute("PRAGMA foreign_keys=ON")
@@ -332,11 +332,66 @@ def test_backup_manager_must_target_same_database(tmp_path: Path) -> None:
         migrate_database(db, BackupManager(other, tmp_path / "backups"))
 
 
-def test_migrate_v11_to_v12_adds_resolution_columns_and_backup(tmp_path: Path) -> None:
+def test_latest_schema_allows_repeated_nss_but_keeps_cedula_unique(tmp_path: Path) -> None:
+    db = tmp_path / "identifiers.db"
+    manager = manager_for(db, tmp_path / "identifier_root")
+    assert migrate_database(db, manager)["created"] is True
+    with closing(sqlite3.connect(db)) as conn:
+        first = conn.execute("INSERT INTO pacientes(nombre) VALUES ('UNO')").lastrowid
+        second = conn.execute("INSERT INTO pacientes(nombre) VALUES ('DOS')").lastrowid
+        conn.execute(
+            "INSERT INTO paciente_identificadores(paciente_id,tipo,valor_normalizado) "
+            "VALUES (?, 'NSS', '123456789')",
+            (first,),
+        )
+        conn.execute(
+            "INSERT INTO paciente_identificadores(paciente_id,tipo,valor_normalizado) "
+            "VALUES (?, 'NSS', '123456789')",
+            (second,),
+        )
+        conn.execute(
+            "INSERT INTO paciente_identificadores(paciente_id,tipo,valor_normalizado) "
+            "VALUES (?, 'CEDULA', '00112345678')",
+            (first,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO paciente_identificadores(paciente_id,tipo,valor_normalizado) "
+                "VALUES (?, 'CEDULA', '00112345678')",
+                (second,),
+            )
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(paciente_identificadores)")}
+        assert "uq_cedula_activa" in indexes
+        assert "uq_identificador_activo" not in indexes
+
+
+def test_migrate_v11_to_latest_adds_resolution_columns_and_backup(tmp_path: Path) -> None:
     db = tmp_path / "v11.db"
     manager = manager_for(db, tmp_path / "v11_root")
     assert migrate_database(db, manager)["created"] is True
     with closing(sqlite3.connect(db)) as conn:
+        patient_id = conn.execute(
+            "INSERT INTO pacientes(nombre,requiere_revision) VALUES ('PENDIENTE',1)"
+        ).lastrowid
+        day_id = conn.execute(
+            "INSERT INTO dias_operativos(fecha_base,fecha_inicio,fecha_fin) "
+            "VALUES ('2026-01-01','2026-01-01 08:00:00','2026-01-02 08:00:00')"
+        ).lastrowid
+        shift_id = conn.execute(
+            "INSERT INTO turnos(dia_operativo_id,fecha_inicio,fecha_fin,representante,tipo_turno) "
+            "VALUES (?,?,?,?,?)",
+            (day_id, "2026-01-01 08:00:00", "2026-01-02 08:00:00", "PRUEBA", "8AM_8AM"),
+        ).lastrowid
+        attention_id = conn.execute(
+            "INSERT INTO atenciones(paciente_id,dia_operativo_id,turno_id,nombre,"
+            "identidad_estado,requiere_revision) VALUES (?,?,?,?,?,?)",
+            (patient_id, day_id, shift_id, "PENDIENTE", "EN_REVISION", 1),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO identidad_conflictos(paciente_id,atencion_id,tipo,detalle) "
+            "VALUES (?,?,?,?)",
+            (patient_id, attention_id, "PRUEBA", "Pendiente anterior"),
+        )
         for column in ("resolucion", "motivo_resolucion", "resuelto_por", "resuelto_at"):
             conn.execute(f"ALTER TABLE identidad_conflictos DROP COLUMN {column}")
         conn.execute("UPDATE schema_version SET version=11 WHERE id=1")
@@ -346,8 +401,18 @@ def test_migrate_v11_to_v12_adds_resolution_columns_and_backup(tmp_path: Path) -
 
     assert result["migrated"] is True
     assert result["from_version"] == 11
-    assert result["to_version"] == 12
-    assert manager.verify(result["backup"])["reason"] == "antes_migracion_v11_a_v12"
+    assert result["to_version"] == LATEST_SCHEMA_VERSION
+    assert manager.verify(result["backup"])["reason"] == (
+        f"antes_migracion_v11_a_v{LATEST_SCHEMA_VERSION}"
+    )
     with closing(sqlite3.connect(db)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(identidad_conflictos)")}
         assert {"resolucion", "motivo_resolucion", "resuelto_por", "resuelto_at"} <= columns
+        assert conn.execute(
+            "SELECT identidad_estado,requiere_revision FROM atenciones WHERE id=?",
+            (attention_id,),
+        ).fetchone() == ("VALIDADA", 0)
+        assert conn.execute(
+            "SELECT estado,resolucion FROM identidad_conflictos WHERE atencion_id=?",
+            (attention_id,),
+        ).fetchone() == ("CERRADO", "FUNCION_RETIRADA")

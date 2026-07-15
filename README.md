@@ -2,10 +2,13 @@
 
 Aplicacion de escritorio para registrar atenciones de emergencia, generar la hoja clinica, actualizar el listado del turno e imprimir dentro del flujo operativo del hospital.
 
-## Version 4.1.3
+## Version 4.1.6
 
 - Pacientes, atenciones, dias operativos y turnos tienen relaciones trazables.
 - Se bloquean duplicados dentro del mismo dia operativo y se permiten reingresos autorizados.
+- La cedula valida tiene prioridad y cada NSS nuevo reemplaza el anterior de esa ficha.
+- Un NSS repetido sin cedula nunca detiene la hoja; queda en Revision NSS dentro de Configuracion.
+- Los respaldos se eliminan automaticamente al superar cuatro dias de antiguedad.
 - Los ID historicos son permanentes y las anulaciones son logicas.
 - La edicion ordinaria no requiere PIN; cada cambio conserva actor, fecha, equipo y valores antes/despues.
 - La purga de pacientes de prueba, restauracion y administracion siguen protegidas por PIN.

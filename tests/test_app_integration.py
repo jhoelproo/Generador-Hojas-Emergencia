@@ -47,7 +47,7 @@ def patient_data(**overrides):
     return data
 
 
-def test_daily_duplicate_identity_conflict_reentry_and_output_states(tmp_path, monkeypatch):
+def test_daily_duplicate_identity_precedence_reentry_and_output_states(tmp_path, monkeypatch):
     module = load_application(tmp_path, monkeypatch)
     manager = module.DatabaseManager()
     shift = valid_shift(module)
@@ -66,23 +66,18 @@ def test_daily_duplicate_identity_conflict_reentry_and_output_states(tmp_path, m
         "GENERAL",
         shift,
     )
-    with pytest.raises(module.ConflictoIdentidadError):
+    # La cédula tiene prioridad. Aunque el NSS corresponda a la primera ficha,
+    # se reconoce que la segunda ya tiene una atención en el día.
+    with pytest.raises(sqlite3.IntegrityError, match="ya tiene una atención"):
         manager.guardar_atencion(
             patient_data(Cédula="00212345679"),
             "GENERAL",
             shift,
         )
-    conflict_ids = manager.obtener_o_registrar_conflictos_cedula(
-        "002-1234567-9",
-        "La cedula pertenece a una ficha diferente del NSS indicado.",
-    )
-    assert len(conflict_ids) == 1
-    assert manager.obtener_o_registrar_conflictos_cedula("00212345679") == conflict_ids
-    targeted = {
-        int(row["id"]): row for row in manager.listar_conflictos_identidad(True, 1000)
-    }
-    assert targeted[conflict_ids[0]]["atencion_id"] == second_id
-    assert targeted[conflict_ids[0]]["tipo"] == "CONFLICTO_CEDULA_DETECTADO"
+    with manager._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM identidad_conflictos WHERE estado='PENDIENTE'"
+        ).fetchone()[0] == 0
 
     reentry_id = manager.guardar_atencion(
         patient_data(
@@ -132,3 +127,83 @@ def test_daily_duplicate_identity_conflict_reentry_and_output_states(tmp_path, m
     destination_results = manager.buscar_pacientes_avanzado("PACIENTE PRUEBA UNO")
     assert destination_results
     assert destination_results[0]["paciente_id"] == original["paciente_id"]
+
+
+def test_new_nss_replaces_previous_identifier_for_same_cedula(tmp_path, monkeypatch):
+    module = load_application(tmp_path, monkeypatch)
+    manager = module.DatabaseManager()
+    original_nss = "123456789"
+    nuevo_nss = "555666777"
+    nss_editado = "888999000"
+
+    patient_id = manager.guardar_paciente(patient_data(NSS=original_nss))
+    assert manager.guardar_paciente(patient_data(NSS=nuevo_nss)) == patient_id
+    _, updated_patients = manager.actualizar_datos_paciente_por_identidad(
+        f"P:{patient_id}", patient_data(NSS=nss_editado), actualizar_ficha=True
+    )
+    assert updated_patients == 1
+
+    with manager._connect() as connection:
+        identifiers = connection.execute(
+            "SELECT valor_normalizado FROM paciente_identificadores "
+            "WHERE paciente_id=? AND tipo='NSS' AND activo=1",
+            (patient_id,),
+        ).fetchall()
+        patient_nss = connection.execute(
+            "SELECT nss_clean FROM pacientes WHERE id=?", (patient_id,)
+        ).fetchone()[0]
+    assert identifiers == [(nss_editado,)]
+    assert patient_nss == nss_editado
+
+
+def test_nss_without_cedula_keeps_flow_and_creates_admin_review(tmp_path, monkeypatch):
+    module = load_application(tmp_path, monkeypatch)
+    manager = module.DatabaseManager()
+    shift = valid_shift(module)
+    shared_nss = "444555666"
+
+    first_id = manager.guardar_atencion(
+        patient_data(
+            Nombre="PACIENTE SIN CEDULA UNO", Cédula="", NSS=shared_nss,
+            Teléfono="8095550201",
+        ),
+        "GENERAL",
+        shift,
+    )
+    inicio, fin = module.obtener_rango_turno_efectivo(shift)
+    contexto = manager.obtener_contexto_turno(shift)
+    assert manager.buscar_atencion_en_turno(
+        shared_nss,"",inicio,fin,turno_id=contexto["turno_id"],
+        dia_operativo_id=contexto["dia_operativo_id"],
+        nombre="PACIENTE SIN CEDULA DOS",telefono="8095550202",
+    ) is None
+    second_id = manager.guardar_atencion(
+        patient_data(
+            Nombre="PACIENTE SIN CEDULA DOS", Cédula="", NSS=shared_nss,
+            Teléfono="8095550202",
+        ),
+        "GENERAL",
+        shift,
+    )
+
+    first = manager.obtener_atencion_por_id(first_id)
+    second = manager.obtener_atencion_por_id(second_id)
+    assert first["paciente_id"] != second["paciente_id"]
+    assert second["identidad_estado"] == "NSS_EN_REVISION"
+    assert manager.obtener_trabajo_salida(second_id) is not None
+    revisions = manager.listar_revisiones_nss(True)
+    assert len(revisions) == 1
+    assert revisions[0]["atencion_id"] == second_id
+    assert revisions[0]["paciente_referencia_id"] == first["paciente_id"]
+
+    manager.resolver_revision_nss(
+        revisions[0]["id"],
+        "FUSIONAR_CON_EXISTENTE",
+        "ADMIN PRUEBA",
+        "Mismo paciente confirmado administrativamente",
+    )
+    merged = manager.obtener_atencion_por_id(second_id)
+    assert merged["paciente_id"] == first["paciente_id"]
+    assert merged["es_reingreso"] == 1
+    assert merged["atencion_origen_id"] == first_id
+    assert manager.listar_revisiones_nss(True) == []

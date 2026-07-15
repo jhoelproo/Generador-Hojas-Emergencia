@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta
@@ -114,6 +115,27 @@ def test_daily_backup_is_idempotent_and_ignores_bad_manifest(sqlite_db: Path, tm
     assert created is not None
     assert manager.ensure_daily() is None
     assert manager.verify(created)["reason"] == "respaldo_diario"
+
+
+def test_four_day_retention_removes_manifest_and_legacy_backups(sqlite_db: Path, tmp_path: Path) -> None:
+    manager = BackupManager(sqlite_db, tmp_path / "backups", retention_days=4)
+    old = manager.create("old")
+    recent = manager.create("recent")
+    old_manifest_path = old / "manifest.json"
+    old_manifest = json.loads(old_manifest_path.read_text(encoding="utf-8"))
+    old_manifest["created_at"] = (datetime.now() - timedelta(days=5)).isoformat(timespec="seconds")
+    old_manifest_path.write_text(json.dumps(old_manifest), encoding="utf-8")
+    legacy = manager.backup_root / "pacientes_pre_migracion_antiguo.db"
+    legacy.write_bytes(b"legacy")
+    old_timestamp = (datetime.now() - timedelta(days=5)).timestamp()
+    os.utime(legacy, (old_timestamp, old_timestamp))
+
+    removed = manager.prune()
+
+    assert removed == 2
+    assert not old.exists()
+    assert not legacy.exists()
+    assert recent.exists()
 
 
 def test_non_sqlite_database_and_invalid_manifest_are_rejected(tmp_path: Path) -> None:

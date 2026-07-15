@@ -1,6 +1,6 @@
 # facturacion_tabs.py
 # Sistema de Formularios de Emergencia - Hospital General
-# Version: 4.1.3 - Acceso directo al conflicto de cedula detectado
+# Version: 4.1.6 - Historial NSS por cedula y revision NSS aislada
 # Python 3.14 compatible
 import os
 import re
@@ -1329,10 +1329,6 @@ class TurnoNoVigenteError(RuntimeError):
     pass
 
 
-class ConflictoIdentidadError(RuntimeError):
-    pass
-
-
 class DatabaseManager:
     SCHEMA_VERSION = LATEST_SCHEMA_VERSION
 
@@ -1342,7 +1338,7 @@ class DatabaseManager:
             self.db_name,
             BACKUPS_DIR,
             related_paths=(TURNOS_CFG, APP_SETTINGS_PATH, EXCEL_PATH),
-            retention_days=45,
+            retention_days=4,
         )
         self._init_db()
 
@@ -1708,34 +1704,47 @@ class DatabaseManager:
 
         with closing(self._connect()) as conn:
             conn.row_factory = sqlite3.Row
-            ids_resueltos = []
-            for tipo, valor, valido in (
-                ("NSS", nss_limpio, is_valid_nss_key(nss_limpio)),
-                ("CEDULA", cedula_limpia, is_valid_cedula_key(cedula_limpia)),
-            ):
-                if not valido:
-                    continue
+            paciente_id = None
+            if is_valid_cedula_key(cedula_limpia):
+                row = conn.execute(
+                    """
+                    SELECT i.paciente_id
+                    FROM paciente_identificadores i
+                    JOIN pacientes p ON p.id=i.paciente_id
+                    WHERE i.tipo='CEDULA' AND i.valor_normalizado=? AND i.activo=1
+                      AND p.estado='ACTIVO'
+                    ORDER BY i.conflicto,COALESCE(p.updated_at,p.created_at) DESC,p.id DESC
+                    LIMIT 1
+                    """,
+                    (cedula_limpia,),
+                ).fetchone()
+                paciente_id = int(row["paciente_id"]) if row else None
+            elif is_valid_nss_key(nss_limpio):
                 rows = conn.execute(
                     """
-                    SELECT DISTINCT paciente_id,conflicto
-                    FROM paciente_identificadores
-                    WHERE tipo=? AND valor_normalizado=? AND activo=1
+                    SELECT p.id,p.nombre,p.telefono_clean,p.telefono
+                    FROM paciente_identificadores i
+                    JOIN pacientes p ON p.id=i.paciente_id
+                    WHERE i.tipo='NSS' AND i.valor_normalizado=? AND i.activo=1
+                      AND p.estado='ACTIVO'
+                    ORDER BY i.conflicto,COALESCE(p.updated_at,p.created_at) DESC,p.id DESC
                     """,
-                    (tipo, valor),
+                    (nss_limpio,),
                 ).fetchall()
-                encontrados = {int(row["paciente_id"]) for row in rows}
-                if len(encontrados) > 1 or any(int(row["conflicto"] or 0) for row in rows):
-                    raise ConflictoIdentidadError(
-                        f"El {tipo} tiene fichas en conflicto y requiere revisión administrativa."
+                for row in rows:
+                    mismo_nombre = bool(
+                        nombre_limpio
+                        and nombre_limpio == normalizar_nombre_clave(row["nombre"])
                     )
-                if encontrados:
-                    ids_resueltos.append(next(iter(encontrados)))
-
-            if len(set(ids_resueltos)) > 1:
-                raise ConflictoIdentidadError(
-                    "El NSS y la cédula pertenecen a pacientes diferentes."
-                )
-            paciente_id = ids_resueltos[0] if ids_resueltos else None
+                    telefono_row = re.sub(
+                        r"\D", "", row["telefono_clean"] or row["telefono"] or ""
+                    )
+                    mismo_telefono = bool(
+                        len(telefono_limpio) == 10 and telefono_limpio == telefono_row
+                    )
+                    if mismo_nombre or mismo_telefono:
+                        paciente_id = int(row["id"])
+                        break
             if paciente_id is None and not (nombre_limpio and len(telefono_limpio) == 10):
                 return None
 
@@ -1780,7 +1789,6 @@ class DatabaseManager:
                 SELECT p.* FROM pacientes p
                 JOIN paciente_identificadores i ON i.paciente_id=p.id
                 WHERE i.tipo='CEDULA' AND i.valor_normalizado=? AND i.activo=1
-                  AND i.conflicto=0 AND p.requiere_revision=0
                 ORDER BY p.updated_at DESC, p.id DESC LIMIT 1
                 """,
                 (cedula_limpia,),
@@ -1797,78 +1805,99 @@ class DatabaseManager:
                 SELECT p.* FROM pacientes p
                 JOIN paciente_identificadores i ON i.paciente_id=p.id
                 WHERE i.tipo='NSS' AND i.valor_normalizado=? AND i.activo=1
-                  AND i.conflicto=0 AND p.requiere_revision=0
                 ORDER BY p.updated_at DESC, p.id DESC LIMIT 1
                 """,
                 (nss_limpio,),
             ).fetchone()
 
-    def _resolver_o_crear_paciente_conn(self, conn, datos):
-        nss = (datos.get('NSS', '') or '').strip().upper()
-        cedula = (datos.get('Cédula', '') or '').strip()
+    def _resolver_o_crear_paciente_conn(self, conn, datos, revisiones_nss=None):
+        conn.row_factory = sqlite3.Row
+        revisiones_nss = revisiones_nss if revisiones_nss is not None else []
+        nss = (datos.get("NSS", "") or "").strip().upper()
+        cedula = (datos.get("Cédula", "") or "").strip()
         nss_clean = re.sub(r"\D", "", nss)
         cedula_clean = re.sub(r"\D", "", cedula)
-        telefono = (datos.get('Teléfono', '') or '').strip()
+        telefono = (datos.get("Teléfono", "") or "").strip()
         telefono_clean = re.sub(r"\D", "", telefono)
+        nombre = (datos.get("Nombre", "") or "").strip() or "SIN NOMBRE"
+        nombre_clean = normalizar_nombre_clave(nombre)
+        cedula_valida = is_valid_cedula_key(cedula_clean)
+        nss_valido = is_valid_nss_key(nss_clean)
 
-        identifiers = []
-        if is_valid_nss_key(nss_clean):
-            identifiers.append(("NSS", nss_clean))
-        if is_valid_cedula_key(cedula_clean):
-            identifiers.append(("CEDULA", cedula_clean))
-
-        patient_sets = []
-        for kind, value in identifiers:
-            rows = conn.execute(
-                "SELECT DISTINCT paciente_id, conflicto FROM paciente_identificadores "
-                "WHERE tipo=? AND valor_normalizado=? AND activo=1",
-                (kind, value),
+        def propietarios(tipo, valor):
+            if not valor:
+                return []
+            return conn.execute(
+                """
+                SELECT p.*,i.conflicto
+                FROM paciente_identificadores i
+                JOIN pacientes p ON p.id=i.paciente_id
+                WHERE i.tipo=? AND i.valor_normalizado=? AND i.activo=1
+                  AND p.estado='ACTIVO'
+                ORDER BY i.conflicto,COALESCE(p.updated_at,p.created_at) DESC,p.id DESC
+                """,
+                (tipo, valor),
             ).fetchall()
-            ids = {int(row[0]) for row in rows}
-            if len(ids) > 1 or any(int(row[1] or 0) for row in rows):
-                raise ConflictoIdentidadError(
-                    f"El {kind} tiene fichas históricas en conflicto. Revíselo en Editar paciente antes de registrar."
-                )
-            if ids:
-                patient_sets.append(ids)
 
-        candidates = set.intersection(*patient_sets) if patient_sets else set()
-        if patient_sets and not candidates:
-            union = set().union(*patient_sets)
-            if len(union) == 1:
-                candidates = union
-            else:
-                raise ConflictoIdentidadError("El NSS y la cédula pertenecen a fichas diferentes.")
+        def coincide_demografia(row):
+            mismo_nombre = bool(
+                nombre_clean
+                and nombre_clean != "SIN NOMBRE"
+                and nombre_clean == normalizar_nombre_clave(row["nombre"])
+            )
+            mismo_telefono = bool(
+                len(telefono_clean) == 10
+                and telefono_clean == re.sub(r"\D", "", row["telefono"] or "")
+            )
+            return mismo_nombre or mismo_telefono
 
-        nombre = (datos.get('Nombre', '') or '').strip() or "SIN NOMBRE"
-        direccion = (datos.get('Dirección', '') or '').strip()
-        nacionalidad = (datos.get('Nacionalidad', '') or '').strip()
-        ars_canonico = normalizar_seguro(datos.get('Aseguradora (ARS)', ''), nss)
-        cedula_db = cedula_clean if is_valid_cedula_key(cedula_clean) else None
-        nss_db = nss_clean if is_valid_nss_key(nss_clean) else None
+        cedula_rows = propietarios("CEDULA", cedula_clean) if cedula_valida else []
+        nss_rows = propietarios("NSS", nss_clean) if nss_valido else []
+        patient_id = int(cedula_rows[0]["id"]) if cedula_rows else None
+
+        # Una ficha creada inicialmente sin cédula puede completarse después.
+        if patient_id is None and nss_rows:
+            coincidencias = [row for row in nss_rows if coincide_demografia(row)]
+            if coincidencias:
+                patient_id = int(coincidencias[0]["id"])
+
+        revision_nss = bool(not cedula_valida and nss_valido and nss_rows and patient_id is None)
+        referencia_id = int(nss_rows[0]["id"]) if revision_nss else None
+
+        direccion = (datos.get("Dirección", "") or "").strip()
+        nacionalidad = (datos.get("Nacionalidad", "") or "").strip()
+        ars_canonico = normalizar_seguro(datos.get("Aseguradora (ARS)", ""), nss)
+        cedula_db = cedula_clean if cedula_valida else None
+        nss_db = nss_clean if nss_valido else None
         telefono_db = telefono_clean if len(telefono_clean) == 10 else None
 
-        if candidates:
-            patient_id = next(iter(candidates))
+        if patient_id is not None:
+            if cedula_valida:
+                # La cédula manda: el NSS nuevo reemplaza todos los NSS anteriores
+                # de esta ficha, incluso cuando el campo se deja vacío.
+                conn.execute(
+                    "DELETE FROM paciente_identificadores WHERE paciente_id=? AND tipo='NSS'",
+                    (patient_id,),
+                )
             conn.execute(
                 """
                 UPDATE pacientes SET
-                    nombre=?, cedula=COALESCE(?,cedula), telefono=COALESCE(?,telefono),
+                    nombre=?,cedula=COALESCE(?,cedula),telefono=COALESCE(?,telefono),
                     direccion=COALESCE(NULLIF(?,''),direccion),
-                    nacionalidad=COALESCE(NULLIF(?,''),nacionalidad),
-                    ars=?, nss=COALESCE(?,nss), nss_clean=COALESCE(?,nss_clean),
-                    cedula_clean=COALESCE(?,cedula_clean), telefono_clean=COALESCE(?,telefono_clean),
-                    provisional=0, updated_at=datetime('now','localtime')
+                    nacionalidad=COALESCE(NULLIF(?,''),nacionalidad),ars=?,
+                    nss=?,nss_clean=?,cedula_clean=COALESCE(?,cedula_clean),
+                    telefono_clean=COALESCE(?,telefono_clean),provisional=0,
+                    requiere_revision=0,updated_at=datetime('now','localtime')
                 WHERE id=?
                 """,
                 (
-                    nombre, cedula_db, telefono_db, direccion, nacionalidad, ars_canonico,
-                    nss_db, nss_db, cedula_db, telefono_db, patient_id,
+                    nombre,cedula_db,telefono_db,direccion,nacionalidad,ars_canonico,
+                    nss_db,nss_db,cedula_db,telefono_db,patient_id,
                 ),
             )
         else:
-            provisional = int(not identifiers)
-            cur = conn.execute(
+            provisional = int(not cedula_valida and not nss_valido)
+            cursor = conn.execute(
                 """
                 INSERT INTO pacientes(
                     nombre,cedula,telefono,direccion,nacionalidad,ars,nss,
@@ -1876,24 +1905,66 @@ class DatabaseManager:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    nombre, cedula_db, telefono_db, direccion, nacionalidad, ars_canonico,
-                    nss_db, nss_db, cedula_db, telefono_db, provisional, provisional,
+                    nombre,cedula_db,telefono_db,direccion,nacionalidad,ars_canonico,
+                    nss_db,nss_db,cedula_db,telefono_db,provisional,int(revision_nss),
                 ),
             )
-            patient_id = int(cur.lastrowid)
+            patient_id = int(cursor.lastrowid)
 
-        for kind, value in identifiers:
+        identificadores = []
+        if cedula_valida:
+            identificadores.append(("CEDULA", cedula_clean, 0))
+        if nss_valido:
+            identificadores.append(("NSS", nss_clean, int(revision_nss)))
+        if revision_nss:
             conn.execute(
-                "INSERT OR IGNORE INTO paciente_identificadores(paciente_id,tipo,valor_normalizado,activo,conflicto) "
-                "VALUES (?,?,?,1,0)",
-                (patient_id, kind, value),
+                "UPDATE paciente_identificadores SET conflicto=1 "
+                "WHERE tipo='NSS' AND valor_normalizado=? AND activo=1",
+                (nss_clean,),
+            )
+        for tipo, valor, conflicto in identificadores:
+            conn.execute(
+                """
+                INSERT INTO paciente_identificadores(
+                    paciente_id,tipo,valor_normalizado,activo,conflicto
+                ) VALUES (?,?,?,1,?)
+                ON CONFLICT(paciente_id,tipo,valor_normalizado)
+                DO UPDATE SET activo=1,conflicto=excluded.conflicto
+                """,
+                (patient_id,tipo,valor,conflicto),
+            )
+
+        if revision_nss:
+            revisiones_nss.append(
+                {
+                    "nss": nss_clean,
+                    "paciente_nuevo_id": patient_id,
+                    "paciente_referencia_id": referencia_id,
+                    "detalle": (
+                        "El NSS fue registrado sin cédula para datos demográficos diferentes. "
+                        "La atención continuó y requiere revisión administrativa."
+                    ),
+                }
             )
         return patient_id
 
     def guardar_paciente(self, datos):
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            patient_id = self._resolver_o_crear_paciente_conn(conn, datos)
+            revisiones_nss = []
+            patient_id = self._resolver_o_crear_paciente_conn(conn, datos, revisiones_nss)
+            for revision in revisiones_nss:
+                conn.execute(
+                    """
+                    INSERT INTO nss_conflictos(
+                        nss_normalizado,paciente_nuevo_id,paciente_referencia_id,detalle
+                    ) VALUES (?,?,?,?)
+                    """,
+                    (
+                        revision["nss"],revision["paciente_nuevo_id"],
+                        revision["paciente_referencia_id"],revision["detalle"],
+                    ),
+                )
             conn.commit()
             return patient_id
 
@@ -1973,6 +2044,7 @@ class DatabaseManager:
             autorizado_por = limpiar_nombre_representante(
                 datos.get("AutorizadoPor") or datos.get("autorizado_por") or ""
             )
+            revisiones_nss = []
             if es_reingreso and (not atencion_origen_id or not motivo_reingreso or not autorizado_por):
                 raise ValueError("El reingreso requiere atención original, motivo y autorización.")
             if es_reingreso:
@@ -1985,26 +2057,11 @@ class DatabaseManager:
                 ).fetchone()
                 if not origen:
                     raise ValueError("La atención original no está activa en este día operativo.")
-                coincide_identidad = (
-                    (is_valid_nss_key(nss_clean) and nss_clean == (origen["nss_clean"] or ""))
-                    or (
-                        is_valid_cedula_key(cedula_clean)
-                        and cedula_clean == (origen["cedula_clean"] or "")
-                    )
-                    or (
-                        normalizar_nombre_clave(datos.get("Nombre", ""))
-                        == normalizar_nombre_clave(origen["nombre"])
-                        and len(telefono_clean) == 10
-                        and telefono_clean == (origen["telefono_clean"] or "")
-                    )
-                )
-                if not coincide_identidad:
-                    raise ConflictoIdentidadError(
-                        "Los datos del reingreso no coinciden con la atención original."
-                    )
                 paciente_id = int(origen["paciente_id"])
             else:
-                paciente_id = self._resolver_o_crear_paciente_conn(conn, datos)
+                paciente_id = self._resolver_o_crear_paciente_conn(
+                    conn, datos, revisiones_nss
+                )
 
             try:
                 cur.execute('''
@@ -2013,7 +2070,7 @@ class DatabaseManager:
                         cedula,telefono,direccion,nacionalidad,ars,hoja,fecha,hora,tipo_atencion,
                         estado,es_reingreso,atencion_origen_id,motivo_reingreso,autorizado_por,
                         identidad_estado,requiere_revision,nss_clean,cedula_clean,telefono_clean
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVA',?,?,?,?,'VALIDADA',0,?,?,?)
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVA',?,?,?,?,?,?,?,?,?)
                 ''', (
                     paciente_id,
                     dia_operativo_id,
@@ -2036,6 +2093,8 @@ class DatabaseManager:
                     int(atencion_origen_id) if atencion_origen_id else None,
                     motivo_reingreso or None,
                     autorizado_por or None,
+                    "NSS_EN_REVISION" if revisiones_nss else "VALIDADA",
+                    int(bool(revisiones_nss)),
                     nss_clean or None,
                     cedula_clean or None,
                     telefono_clean or None,
@@ -2048,6 +2107,20 @@ class DatabaseManager:
                     ) from exc
                 raise
             atencion_id = int(cur.lastrowid)
+            for revision in revisiones_nss:
+                conn.execute(
+                    """
+                    INSERT INTO nss_conflictos(
+                        nss_normalizado,paciente_nuevo_id,paciente_referencia_id,
+                        atencion_id,detalle
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        revision["nss"],revision["paciente_nuevo_id"],
+                        revision["paciente_referencia_id"],atencion_id,
+                        revision["detalle"],
+                    ),
+                )
             snapshot = dict(conn.execute("SELECT * FROM atenciones WHERE id=?", (atencion_id,)).fetchone())
             self._registrar_auditoria_conn(
                 conn,
@@ -2062,6 +2135,163 @@ class DatabaseManager:
             cur.execute("INSERT INTO trabajos_salida(atencion_id) VALUES (?)", (atencion_id,))
             conn.commit()
             return atencion_id
+
+    def obtener_revision_nss_atencion(self, atencion_id):
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT id FROM nss_conflictos WHERE atencion_id=? AND estado='PENDIENTE' LIMIT 1",
+                (int(atencion_id),),
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    def listar_revisiones_nss(self, solo_pendientes=True, limite=500):
+        where = "WHERE c.estado='PENDIENTE'" if solo_pendientes else ""
+        with closing(self._connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT c.*,pn.nombre AS nombre_nuevo,pr.nombre AS nombre_referencia,
+                       a.fecha,a.hora,a.estado AS atencion_estado
+                FROM nss_conflictos c
+                LEFT JOIN pacientes pn ON pn.id=c.paciente_nuevo_id
+                LEFT JOIN pacientes pr ON pr.id=c.paciente_referencia_id
+                LEFT JOIN atenciones a ON a.id=c.atencion_id
+                {where}
+                ORDER BY CASE WHEN c.estado='PENDIENTE' THEN 0 ELSE 1 END,c.id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limite)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def resolver_revision_nss(self, revision_id, resolucion, actor, motivo):
+        resolucion = str(resolucion or "").strip().upper()
+        if resolucion not in {
+            "MANTENER_AMBOS", "DESVINCULAR_NSS", "FUSIONAR_CON_EXISTENTE"
+        }:
+            raise ValueError("Resolución NSS desconocida.")
+        actor = limpiar_nombre_representante(actor)
+        motivo = str(motivo or "").strip()
+        if not actor or len(motivo) < 8:
+            raise ValueError("Indique el responsable y un motivo de al menos 8 caracteres.")
+
+        with closing(self._connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            revision = conn.execute(
+                "SELECT * FROM nss_conflictos WHERE id=?",
+                (int(revision_id),),
+            ).fetchone()
+            if not revision or revision["estado"] != "PENDIENTE":
+                conn.rollback()
+                raise ValueError("La revisión ya no está pendiente.")
+            nuevo_id = revision["paciente_nuevo_id"]
+            referencia_id = revision["paciente_referencia_id"]
+            nss = revision["nss_normalizado"]
+
+            if resolucion == "MANTENER_AMBOS":
+                pass
+            elif resolucion == "DESVINCULAR_NSS":
+                if nuevo_id:
+                    conn.execute(
+                        "DELETE FROM paciente_identificadores "
+                        "WHERE paciente_id=? AND tipo='NSS' AND valor_normalizado=?",
+                        (int(nuevo_id), nss),
+                    )
+                    conn.execute(
+                        "UPDATE pacientes SET nss=NULL,nss_clean=NULL,requiere_revision=0,"
+                        "updated_at=datetime('now','localtime') "
+                        "WHERE id=? AND nss_clean=?",
+                        (int(nuevo_id), nss),
+                    )
+                if revision["atencion_id"]:
+                    aid = int(revision["atencion_id"])
+                    before = conn.execute("SELECT * FROM atenciones WHERE id=?", (aid,)).fetchone()
+                    conn.execute(
+                        "UPDATE atenciones SET nss=NULL,nss_clean=NULL,identidad_estado='VALIDADA',"
+                        "requiere_revision=0,updated_at=datetime('now','localtime') WHERE id=?",
+                        (aid,),
+                    )
+                    after = conn.execute("SELECT * FROM atenciones WHERE id=?", (aid,)).fetchone()
+                    if before and after:
+                        self._registrar_auditoria_conn(
+                            conn,aid,"CORRECCION_NSS",motivo,actor,dict(before),dict(after),"ADMINISTRADOR"
+                        )
+            else:
+                if not nuevo_id or not referencia_id:
+                    conn.rollback()
+                    raise ValueError("No existen ambas fichas para realizar la fusión.")
+                atenciones = conn.execute(
+                    "SELECT * FROM atenciones WHERE paciente_id=? ORDER BY id",
+                    (int(nuevo_id),),
+                ).fetchall()
+                for atencion in atenciones:
+                    aid = int(atencion["id"])
+                    existente = conn.execute(
+                        """
+                        SELECT id FROM atenciones
+                        WHERE paciente_id=? AND dia_operativo_id=? AND estado='ACTIVA'
+                          AND es_reingreso=0 AND id<>? ORDER BY id LIMIT 1
+                        """,
+                        (int(referencia_id),atencion["dia_operativo_id"],aid),
+                    ).fetchone()
+                    conn.execute(
+                        """
+                        UPDATE atenciones SET paciente_id=?,es_reingreso=?,atencion_origen_id=?,
+                            motivo_reingreso=?,autorizado_por=?,identidad_estado='VALIDADA',
+                            requiere_revision=0,updated_at=datetime('now','localtime')
+                        WHERE id=?
+                        """,
+                        (
+                            int(referencia_id),int(bool(existente)),
+                            int(existente[0]) if existente else atencion["atencion_origen_id"],
+                            motivo if existente else atencion["motivo_reingreso"],
+                            actor if existente else atencion["autorizado_por"],aid,
+                        ),
+                    )
+                    after = conn.execute("SELECT * FROM atenciones WHERE id=?", (aid,)).fetchone()
+                    self._registrar_auditoria_conn(
+                        conn,aid,"FUSION_NSS",motivo,actor,dict(atencion),dict(after),"ADMINISTRADOR"
+                    )
+                conn.execute(
+                    "DELETE FROM paciente_identificadores WHERE paciente_id=?",
+                    (int(nuevo_id),),
+                )
+                conn.execute("DELETE FROM pacientes WHERE id=?", (int(nuevo_id),))
+
+            otros_pendientes = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM nss_conflictos "
+                    "WHERE nss_normalizado=? AND estado='PENDIENTE' AND id<>?",
+                    (nss, int(revision_id)),
+                ).fetchone()[0]
+            )
+            if not otros_pendientes:
+                conn.execute(
+                    "UPDATE paciente_identificadores SET conflicto=0 "
+                    "WHERE tipo='NSS' AND valor_normalizado=? AND activo=1",
+                    (nss,),
+                )
+
+            if nuevo_id:
+                conn.execute(
+                    "UPDATE pacientes SET requiere_revision=0 WHERE id=?",
+                    (int(nuevo_id),),
+                )
+            if revision["atencion_id"]:
+                conn.execute(
+                    "UPDATE atenciones SET identidad_estado='VALIDADA',requiere_revision=0 WHERE id=?",
+                    (int(revision["atencion_id"]),),
+                )
+            conn.execute(
+                """
+                UPDATE nss_conflictos SET estado='RESUELTO',resolucion=?,motivo_resolucion=?,
+                    resuelto_por=?,resuelto_at=datetime('now','localtime') WHERE id=?
+                """,
+                (resolucion,motivo,actor,int(revision_id)),
+            )
+            conn.commit()
+        return True
 
     def actualizar_trabajo_salida(
         self,
@@ -2432,18 +2662,14 @@ class DatabaseManager:
                 ident_normalizado = re.sub(r"\D", "", ident)
                 rows = conn.execute(
                     """
-                    SELECT DISTINCT paciente_id FROM paciente_identificadores
-                    WHERE activo=1 AND conflicto=0 AND valor_normalizado=?
+                    SELECT paciente_id FROM paciente_identificadores
+                    WHERE activo=1 AND valor_normalizado=?
+                    ORDER BY conflicto,id DESC LIMIT 1
                     """,
                     (ident_normalizado,),
                 ).fetchall()
-                patient_ids = {int(row[0]) for row in rows}
-                if len(patient_ids) > 1:
-                    raise ConflictoIdentidadError(
-                        "La identidad coincide con varias fichas. Seleccione una atención concreta."
-                    )
-                if len(patient_ids) == 1:
-                    patient_id = next(iter(patient_ids))
+                if rows:
+                    patient_id = int(rows[0][0])
             if patient_id is None:
                 return None
 
@@ -2707,15 +2933,12 @@ class DatabaseManager:
             else:
                 clean_ident = re.sub(r"\D", "", ident)
                 patient_rows = cur.execute(
-                    "SELECT DISTINCT paciente_id FROM paciente_identificadores "
-                    "WHERE valor_normalizado=? AND activo=1 AND conflicto=0",
+                    "SELECT paciente_id FROM paciente_identificadores "
+                    "WHERE valor_normalizado=? AND activo=1 "
+                    "ORDER BY conflicto,id DESC LIMIT 1",
                     (clean_ident,),
                 ).fetchall()
-                ids = {int(row[0]) for row in patient_rows}
-                if len(ids) > 1:
-                    conn.rollback()
-                    raise ConflictoIdentidadError("La identidad coincide con más de una ficha.")
-                patient_id = next(iter(ids)) if ids else None
+                patient_id = int(patient_rows[0][0]) if patient_rows else None
             if objetivo:
                 patient_id = int(objetivo["paciente_id"])
             elif patient_id is not None:
@@ -2735,25 +2958,6 @@ class DatabaseManager:
                 nuevos_ids.append(("NSS", nss_clean))
             if is_valid_cedula_key(cedula_clean):
                 nuevos_ids.append(("CEDULA", cedula_clean))
-            identidad_divergente = False
-            for kind, value in nuevos_ids:
-                owners = cur.execute(
-                    """
-                    SELECT DISTINCT paciente_id FROM paciente_identificadores
-                    WHERE tipo=? AND valor_normalizado=? AND activo=1 AND conflicto=0
-                    """,
-                    (kind, value),
-                ).fetchall()
-                owner_ids = {int(row[0]) for row in owners}
-                if owner_ids - {patient_id}:
-                    conn.rollback()
-                    raise ConflictoIdentidadError(
-                        f"El {kind} indicado pertenece a otra ficha. No se aplicaron cambios."
-                    )
-                if patient_id not in owner_ids:
-                    identidad_divergente = True
-            identidad_estado = "VALIDADA" if actualizar_ficha or not identidad_divergente else "DIVERGENTE"
-
             atenciones_actualizadas = 0
             if objetivo:
                 objetivo_id = int(objetivo["id"])
@@ -2766,8 +2970,7 @@ class DatabaseManager:
                 ''', (
                     nombre, cedula, telefono, direccion, nacionalidad, nss, ars,
                     nss_clean or None, cedula_clean or None,
-                    re.sub(r"\D", "", telefono) or None, identidad_estado,
-                    int(identidad_estado == "DIVERGENTE"), objetivo_id,
+                    re.sub(r"\D", "", telefono) or None, "VALIDADA", 0, objetivo_id,
                 ))
                 atenciones_actualizadas = cur.rowcount
                 after = dict(cur.execute("SELECT * FROM atenciones WHERE id=?", (objetivo_id,)).fetchone())
@@ -2785,6 +2988,8 @@ class DatabaseManager:
             pacientes_actualizados = 0
             if actualizar_ficha:
                 for kind, value in nuevos_ids:
+                    if kind != "CEDULA":
+                        continue
                     conflict = cur.execute(
                         "SELECT paciente_id FROM paciente_identificadores "
                         "WHERE tipo=? AND valor_normalizado=? AND activo=1 AND paciente_id<>? LIMIT 1",
@@ -2792,8 +2997,8 @@ class DatabaseManager:
                     ).fetchone()
                     if conflict:
                         conn.rollback()
-                        raise ConflictoIdentidadError(
-                            f"El {kind} indicado ya pertenece a otra ficha y no puede reasignarse automáticamente."
+                        raise ValueError(
+                            f"El {kind} indicado ya está asignado a otra ficha."
                         )
                 cur.execute('''
                     UPDATE pacientes SET
@@ -2815,9 +3020,8 @@ class DatabaseManager:
                 for kind in ("NSS", "CEDULA"):
                     new_value = next((value for item_kind, value in nuevos_ids if item_kind == kind), None)
                     cur.execute(
-                        "UPDATE paciente_identificadores SET activo=0 "
-                        "WHERE paciente_id=? AND tipo=? AND activo=1 AND valor_normalizado<>COALESCE(?, '')",
-                        (patient_id, kind, new_value),
+                        "DELETE FROM paciente_identificadores WHERE paciente_id=? AND tipo=?",
+                        (patient_id, kind),
                     )
                     if new_value:
                         cur.execute(
@@ -3016,346 +3220,6 @@ class DatabaseManager:
                 latest_by_patient[patient_id] = row
         return list(latest_by_patient.values())
 
-    def listar_conflictos_identidad(self, solo_pendientes=True, limite=500):
-        where = "WHERE c.estado='PENDIENTE'" if solo_pendientes else ""
-        with closing(self._connect()) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                f"""
-                SELECT c.*,p.nombre AS paciente_nombre,a.nombre AS atencion_nombre,
-                       a.fecha,a.hora,a.nss,a.cedula,a.dia_operativo_id
-                FROM identidad_conflictos c
-                LEFT JOIN pacientes p ON p.id=c.paciente_id
-                LEFT JOIN atenciones a ON a.id=c.atencion_id
-                {where}
-                ORDER BY CASE WHEN c.estado='PENDIENTE' THEN 0 ELSE 1 END,c.id
-                LIMIT ?
-                """,
-                (max(1, int(limite)),),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def obtener_o_registrar_conflictos_cedula(self, cedula, detalle=""):
-        cedula_clean = re.sub(r"\D", "", str(cedula or ""))
-        if not is_valid_cedula_key(cedula_clean):
-            return []
-
-        with closing(self._connect()) as conn:
-            conn.row_factory = sqlite3.Row
-            conn.execute("BEGIN IMMEDIATE")
-            propietarios = [
-                int(row["paciente_id"])
-                for row in conn.execute(
-                    """
-                    SELECT DISTINCT paciente_id
-                    FROM paciente_identificadores
-                    WHERE tipo='CEDULA' AND valor_normalizado=? AND activo=1
-                    ORDER BY paciente_id
-                    """,
-                    (cedula_clean,),
-                ).fetchall()
-            ]
-            if not propietarios:
-                conn.rollback()
-                return []
-
-            conflicto = conn.execute(
-                """
-                SELECT DISTINCT c.id
-                FROM identidad_conflictos c
-                LEFT JOIN atenciones a ON a.id=c.atencion_id
-                WHERE c.estado='PENDIENTE'
-                  AND c.tipo<>'POSIBLE_REINGRESO'
-                  AND (
-                    a.cedula_clean=?
-                    OR (
-                        c.atencion_id IS NULL
-                        AND c.paciente_id IN (
-                            SELECT paciente_id
-                            FROM paciente_identificadores
-                            WHERE tipo='CEDULA' AND valor_normalizado=? AND activo=1
-                        )
-                    )
-                  )
-                ORDER BY CASE WHEN c.tipo='CONFLICTO_CEDULA_DETECTADO' THEN 0 ELSE 1 END,c.id
-                LIMIT 1
-                """,
-                (cedula_clean, cedula_clean),
-            ).fetchone()
-            if conflicto:
-                conn.commit()
-                return [int(conflicto["id"])]
-
-            paciente_id = propietarios[0]
-            atencion = conn.execute(
-                """
-                SELECT id FROM atenciones
-                WHERE paciente_id=? AND cedula_clean=?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (paciente_id, cedula_clean),
-            ).fetchone()
-            atencion_id = int(atencion["id"]) if atencion else None
-            mensaje = str(detalle or "").strip() or (
-                "Conflicto de cédula detectado al intentar registrar una atención."
-            )
-            cursor = conn.execute(
-                """
-                INSERT INTO identidad_conflictos(paciente_id,atencion_id,tipo,detalle)
-                VALUES (?,?,'CONFLICTO_CEDULA_DETECTADO',?)
-                """,
-                (paciente_id, atencion_id, mensaje),
-            )
-            conflicto_id = int(cursor.lastrowid)
-            conn.execute(
-                "UPDATE pacientes SET requiere_revision=1,updated_at=datetime('now','localtime') WHERE id=?",
-                (paciente_id,),
-            )
-            if atencion_id is not None:
-                conn.execute(
-                    "UPDATE atenciones SET requiere_revision=1,identidad_estado='EN_REVISION' WHERE id=?",
-                    (atencion_id,),
-                )
-            conn.commit()
-            return [conflicto_id]
-
-    def _refrescar_flags_revision_conn(self, conn, paciente_ids, atencion_ids):
-        for atencion_id in {int(value) for value in atencion_ids if value}:
-            pendientes = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM identidad_conflictos WHERE atencion_id=? AND estado='PENDIENTE'",
-                    (atencion_id,),
-                ).fetchone()[0]
-            )
-            conn.execute(
-                "UPDATE atenciones SET requiere_revision=?,identidad_estado=? WHERE id=?",
-                (int(pendientes > 0), "EN_REVISION" if pendientes else "VALIDADA", atencion_id),
-            )
-        for paciente_id in {int(value) for value in paciente_ids if value}:
-            pendientes = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM identidad_conflictos WHERE paciente_id=? AND estado='PENDIENTE'",
-                    (paciente_id,),
-                ).fetchone()[0]
-            )
-            conn.execute(
-                "UPDATE pacientes SET requiere_revision=?,updated_at=datetime('now','localtime') WHERE id=?",
-                (int(pendientes > 0), paciente_id),
-            )
-
-    def resolver_conflicto_identidad(
-        self,
-        conflicto_id,
-        resolucion,
-        actor,
-        motivo,
-        *,
-        paciente_destino_id=None,
-    ):
-        resolucion = str(resolucion or "").strip().upper()
-        actor = limpiar_nombre_representante(actor)
-        motivo = str(motivo or "").strip()
-        if resolucion not in {"MANTENER_SEPARADO", "REASIGNAR_ATENCION", "FUSIONAR_FICHA"}:
-            raise ValueError("Resolución de identidad desconocida.")
-        if not actor or len(motivo) < 8:
-            raise ValueError("La resolución requiere actor y un motivo de al menos 8 caracteres.")
-
-        with closing(self._connect()) as conn:
-            conn.row_factory = sqlite3.Row
-            conn.execute("BEGIN IMMEDIATE")
-            conflicto = conn.execute(
-                "SELECT * FROM identidad_conflictos WHERE id=?",
-                (int(conflicto_id),),
-            ).fetchone()
-            if not conflicto or conflicto["estado"] != "PENDIENTE":
-                conn.rollback()
-                raise ValueError("El conflicto ya no está pendiente.")
-            atencion_id = conflicto["atencion_id"]
-            paciente_origen_id = conflicto["paciente_id"]
-            if paciente_origen_id is None and atencion_id:
-                row = conn.execute(
-                    "SELECT paciente_id FROM atenciones WHERE id=?", (int(atencion_id),)
-                ).fetchone()
-                paciente_origen_id = int(row[0]) if row else None
-            afectados_pacientes = {paciente_origen_id}
-            afectados_atenciones = {atencion_id}
-
-            if resolucion in {"REASIGNAR_ATENCION", "FUSIONAR_FICHA"}:
-                try:
-                    destino_id = int(paciente_destino_id)
-                except (TypeError, ValueError) as exc:
-                    conn.rollback()
-                    raise ValueError("Indique un ID de ficha destino válido.") from exc
-                destino = conn.execute(
-                    "SELECT * FROM pacientes WHERE id=? AND estado='ACTIVO'", (destino_id,)
-                ).fetchone()
-                if not destino or destino_id == paciente_origen_id:
-                    conn.rollback()
-                    raise ValueError("La ficha destino no existe o coincide con la ficha origen.")
-                afectados_pacientes.add(destino_id)
-
-            if resolucion == "REASIGNAR_ATENCION":
-                if not atencion_id:
-                    conn.rollback()
-                    raise ValueError("Este conflicto no tiene una atención para reasignar.")
-                hijos = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM atenciones WHERE atencion_origen_id=? AND estado='ACTIVA'",
-                        (int(atencion_id),),
-                    ).fetchone()[0]
-                )
-                if hijos:
-                    conn.rollback()
-                    raise ValueError("No se puede reasignar una atención que es origen de reingresos activos.")
-                before = dict(
-                    conn.execute("SELECT * FROM atenciones WHERE id=?", (int(atencion_id),)).fetchone()
-                )
-                existente = conn.execute(
-                    """
-                    SELECT id FROM atenciones
-                    WHERE paciente_id=? AND dia_operativo_id=? AND estado='ACTIVA'
-                      AND es_reingreso=0 AND id<>?
-                    ORDER BY id LIMIT 1
-                    """,
-                    (destino_id, before["dia_operativo_id"], int(atencion_id)),
-                ).fetchone()
-                conn.execute(
-                    """
-                    UPDATE atenciones SET paciente_id=?,es_reingreso=?,atencion_origen_id=?,
-                        motivo_reingreso=?,autorizado_por=?,identidad_estado='VALIDADA',
-                        requiere_revision=0,updated_at=datetime('now','localtime')
-                    WHERE id=?
-                    """,
-                    (
-                        destino_id,
-                        int(bool(existente)),
-                        int(existente[0]) if existente else None,
-                        motivo if existente else None,
-                        actor if existente else None,
-                        int(atencion_id),
-                    ),
-                )
-                after = dict(
-                    conn.execute("SELECT * FROM atenciones WHERE id=?", (int(atencion_id),)).fetchone()
-                )
-                self._registrar_auditoria_conn(
-                    conn,
-                    int(atencion_id),
-                    "REASIGNACION_IDENTIDAD",
-                    motivo,
-                    actor,
-                    before,
-                    after,
-                    "OPERADOR",
-                )
-
-            elif resolucion == "FUSIONAR_FICHA":
-                if paciente_origen_id is None:
-                    conn.rollback()
-                    raise ValueError("El conflicto no identifica una ficha origen.")
-                atenciones_origen = conn.execute(
-                    "SELECT * FROM atenciones WHERE paciente_id=? ORDER BY id",
-                    (int(paciente_origen_id),),
-                ).fetchall()
-                for row in atenciones_origen:
-                    aid = int(row["id"])
-                    afectados_atenciones.add(aid)
-                    existente = conn.execute(
-                        """
-                        SELECT id FROM atenciones
-                        WHERE paciente_id=? AND dia_operativo_id=? AND estado='ACTIVA'
-                          AND es_reingreso=0 AND id<>?
-                        ORDER BY id LIMIT 1
-                        """,
-                        (destino_id, row["dia_operativo_id"], aid),
-                    ).fetchone()
-                    conn.execute(
-                        """
-                        UPDATE atenciones SET paciente_id=?,es_reingreso=?,atencion_origen_id=?,
-                            motivo_reingreso=?,autorizado_por=?,identidad_estado='VALIDADA',
-                            requiere_revision=0,updated_at=datetime('now','localtime')
-                        WHERE id=?
-                        """,
-                        (
-                            destino_id,
-                            int(bool(existente) or int(row["es_reingreso"] or 0)),
-                            int(existente[0]) if existente else row["atencion_origen_id"],
-                            motivo if existente else row["motivo_reingreso"],
-                            actor if existente else row["autorizado_por"],
-                            aid,
-                        ),
-                    )
-                    after = dict(conn.execute("SELECT * FROM atenciones WHERE id=?", (aid,)).fetchone())
-                    self._registrar_auditoria_conn(
-                        conn,
-                        aid,
-                        "FUSION_FICHA",
-                        motivo,
-                        actor,
-                        dict(row),
-                        after,
-                        "OPERADOR",
-                    )
-
-                identificadores = conn.execute(
-                    "SELECT tipo,valor_normalizado FROM paciente_identificadores WHERE paciente_id=?",
-                    (int(paciente_origen_id),),
-                ).fetchall()
-                conn.execute(
-                    "DELETE FROM paciente_identificadores WHERE paciente_id=?",
-                    (int(paciente_origen_id),),
-                )
-                for identificador in identificadores:
-                    otros = int(
-                        conn.execute(
-                            """
-                            SELECT COUNT(DISTINCT paciente_id) FROM paciente_identificadores
-                            WHERE tipo=? AND valor_normalizado=? AND activo=1 AND paciente_id<>?
-                            """,
-                            (identificador["tipo"], identificador["valor_normalizado"], destino_id),
-                        ).fetchone()[0]
-                    )
-                    conflicto_flag = int(otros > 0)
-                    if conflicto_flag:
-                        conn.execute(
-                            "UPDATE paciente_identificadores SET conflicto=1 WHERE tipo=? AND valor_normalizado=?",
-                            (identificador["tipo"], identificador["valor_normalizado"]),
-                        )
-                    conn.execute(
-                        """
-                        INSERT INTO paciente_identificadores(
-                            paciente_id,tipo,valor_normalizado,activo,conflicto
-                        ) VALUES (?,?,?,1,?)
-                        ON CONFLICT(paciente_id,tipo,valor_normalizado)
-                        DO UPDATE SET activo=1,conflicto=excluded.conflicto
-                        """,
-                        (
-                            destino_id,
-                            identificador["tipo"],
-                            identificador["valor_normalizado"],
-                            conflicto_flag,
-                        ),
-                    )
-                conn.execute(
-                    "UPDATE identidad_conflictos SET paciente_id=? WHERE paciente_id=? AND id<>?",
-                    (destino_id, int(paciente_origen_id), int(conflicto_id)),
-                )
-                conn.execute("DELETE FROM pacientes WHERE id=?", (int(paciente_origen_id),))
-
-            conn.execute(
-                """
-                UPDATE identidad_conflictos SET estado='RESUELTO',resolucion=?,motivo_resolucion=?,
-                    resuelto_por=?,resuelto_at=datetime('now','localtime')
-                WHERE id=?
-                """,
-                (resolucion, motivo, actor, int(conflicto_id)),
-            )
-            self._refrescar_flags_revision_conn(
-                conn, afectados_pacientes, afectados_atenciones
-            )
-            conn.commit()
-        return True
-
     def actualizar_atencion_especifica(
         self,
         atencion_id: int,
@@ -3402,25 +3266,6 @@ class DatabaseManager:
                 identificadores.append(("NSS", nss_clean))
             if is_valid_cedula_key(cedula_clean):
                 identificadores.append(("CEDULA", cedula_clean))
-            identidad_divergente = False
-            for tipo, valor in identificadores:
-                owners = cur.execute(
-                    """
-                    SELECT DISTINCT paciente_id FROM paciente_identificadores
-                    WHERE tipo=? AND valor_normalizado=? AND activo=1 AND conflicto=0
-                    """,
-                    (tipo, valor),
-                ).fetchall()
-                owner_ids = {int(row[0]) for row in owners}
-                if owner_ids - {paciente_id}:
-                    conn.rollback()
-                    raise ConflictoIdentidadError(
-                        f"El {tipo} ya está vinculado a otra ficha. No se aplicaron cambios."
-                    )
-                if paciente_id not in owner_ids:
-                    identidad_divergente = True
-            identidad_estado = "VALIDADA" if actualizar_ficha or not identidad_divergente else "DIVERGENTE"
-            requiere_revision = int(identidad_estado == "DIVERGENTE")
             cur.execute("""
                 UPDATE atenciones
                 SET nombre=?, fecha=?, hora=?, hoja=?, ars=?, nss=?, cedula=?, telefono=?, direccion=?, nacionalidad=?,
@@ -3430,12 +3275,14 @@ class DatabaseManager:
                 WHERE id=?
             """, (nombre, fecha, hora, hoja, ars, nss, cedula, telefono, direccion, nacionalidad,
                   edad_num, unidad, tipo_atencion, nss_clean or None,
-                  cedula_clean or None, telefono_clean or None, identidad_estado,
-                  requiere_revision, int(atencion_id)))
+                  cedula_clean or None, telefono_clean or None, "VALIDADA",
+                  0, int(atencion_id)))
             rowcount = cur.rowcount
 
             if actualizar_ficha:
                 for tipo, valor in identificadores:
+                    if tipo != "CEDULA":
+                        continue
                     ajenos = cur.execute(
                         """
                         SELECT DISTINCT paciente_id FROM paciente_identificadores
@@ -3445,8 +3292,8 @@ class DatabaseManager:
                     ).fetchall()
                     if ajenos:
                         conn.rollback()
-                        raise ConflictoIdentidadError(
-                            f"El {tipo} ya está vinculado a otra ficha. No se aplicaron cambios."
+                        raise ValueError(
+                            f"El {tipo} ya está asignado a otra ficha."
                         )
 
                 cur.execute(
@@ -3474,7 +3321,7 @@ class DatabaseManager:
                 )
                 for tipo in ("NSS", "CEDULA"):
                     cur.execute(
-                        "UPDATE paciente_identificadores SET activo=0 WHERE paciente_id=? AND tipo=?",
+                        "DELETE FROM paciente_identificadores WHERE paciente_id=? AND tipo=?",
                         (paciente_id, tipo),
                     )
                 for tipo, valor in identificadores:
@@ -5108,7 +4955,6 @@ class App:
         self.actions_menu.add_command(label="Listado de Excel", command=self._abrir_excel_actual)
         self.actions_menu.add_separator()
         self.actions_menu.add_command(label="Editar paciente", command=self._abrir_edicion_paciente)
-        self.actions_menu.add_command(label="Revisar conflictos de identidad", command=self.abrir_revision_identidades)
         self.actions_menu.add_command(label="Impresiones y documentos pendientes", command=self.abrir_trabajos_salida_pendientes)
         self.actions_menu.add_command(label="Buscar actualizaciones", command=self.buscar_actualizaciones)
         self.actions_menu.add_command(label="Configuración", command=self._abrir_configuracion_interna)
@@ -5378,7 +5224,6 @@ class App:
         self.configuracion_interna_win = None
         self.salida_pendiente_win = None
         self.trabajos_salida_win = None
-        self.revision_identidad_win = None
         self._output_payloads = {}
 
         self.menu_contextual = tk.Menu(self.root, tearoff=0)
@@ -5928,7 +5773,6 @@ class App:
                 "edicion_paciente_win",
                 "salida_pendiente_win",
                 "trabajos_salida_win",
-                "revision_identidad_win",
             ):
                 try:
                     w = getattr(self, attr, None)
@@ -6533,7 +6377,6 @@ class App:
         # FASE 14: Icono uniforme 🛡
         add_action("Ver Historial sin Seguro", "🛡", self.abrir_historial_sin_seguros, WARNING)
         add_action("Editar paciente", "🖉", self._abrir_edicion_paciente, PRIMARY)
-        add_action("Revisar conflictos", "?", self.abrir_revision_identidades, INFO)
         add_action("Impresiones pendientes", "!", self.abrir_trabajos_salida_pendientes, WARNING)
         add_action("Configuración interna", "⚙", self._abrir_configuracion_interna, SECONDARY)
 
@@ -8379,297 +8222,6 @@ class App:
         tree.bind("<Double-1>", lambda _event: reintentar_seleccion())
         cargar()
 
-    def abrir_revision_identidades(self, conflicto_ids=None):
-        ids_objetivo = {
-            int(value) for value in (conflicto_ids or []) if str(value).strip().isdigit()
-        }
-        if ids_objetivo and self._ventana_activa(self.revision_identidad_win):
-            try:
-                self.revision_identidad_win.destroy()
-            except Exception:
-                pass
-            self.revision_identidad_win = None
-        actor = self._actor_actual()
-        win = self._crear_toplevel_estable(
-            "Revisión de identidades", "1180x650", "revision_identidad_win"
-        )
-        if win is None:
-            return
-        cont = tb.Frame(win, padding=14, style="Root.TFrame")
-        cont.pack(fill="both", expand=True)
-        tb.Label(
-            cont,
-            text=(
-                "Conflicto de cédula detectado"
-                if ids_objetivo
-                else "Conflictos de identidad pendientes"
-            ),
-            font=("Arial", 15, "bold"),
-        ).pack(anchor="w", pady=(0, 6))
-        tb.Label(
-            cont,
-            text=(
-                (
-                    "Se seleccionó el caso que impidió registrar la atención. Revise sus datos "
-                    "y aplique la resolución correspondiente."
-                )
-                if ids_objetivo
-                else (
-                    "Cada decisión queda registrada. Fusionar mueve todas las atenciones de la ficha "
-                    "origen; reasignar mueve solo la atención seleccionada."
-                )
-            ),
-            style="Muted.TLabel",
-            wraplength=1100,
-        ).pack(anchor="w", pady=(0, 12))
-
-        columnas = ("conflicto", "tipo", "ficha", "atencion", "paciente", "fecha", "detalle")
-        tree = ttk.Treeview(cont, columns=columnas, show="headings", style="Modern.Treeview")
-        titulos = {
-            "conflicto": "Conflicto",
-            "tipo": "Tipo",
-            "ficha": "Ficha",
-            "atencion": "Atención",
-            "paciente": "Paciente",
-            "fecha": "Fecha",
-            "detalle": "Detalle",
-        }
-        anchos = {"conflicto": 75, "tipo": 145, "ficha": 70, "atencion": 75, "paciente": 230, "fecha": 100, "detalle": 360}
-        for columna in columnas:
-            tree.heading(columna, text=titulos[columna])
-            tree.column(columna, width=anchos[columna], anchor="w")
-        tree.pack(fill="both", expand=True)
-        registros = {}
-
-        def cargar():
-            registros.clear()
-            for item in tree.get_children():
-                tree.delete(item)
-            for row in self.db.listar_conflictos_identidad(True, 1000):
-                cid = int(row["id"])
-                if ids_objetivo and cid not in ids_objetivo:
-                    continue
-                registros[cid] = row
-                tree.insert(
-                    "",
-                    "end",
-                    iid=str(cid),
-                    values=(
-                        cid,
-                        row.get("tipo") or "",
-                        row.get("paciente_id") or "",
-                        row.get("atencion_id") or "",
-                        row.get("paciente_nombre") or row.get("atencion_nombre") or "",
-                        row.get("fecha") or "",
-                        row.get("detalle") or "",
-                    ),
-                )
-            if registros:
-                primero = str(next(iter(registros)))
-                tree.selection_set(primero)
-                tree.focus(primero)
-                tree.see(primero)
-            if not registros:
-                if ids_objetivo:
-                    self.set_status("El conflicto indicado ya no está pendiente", "warning")
-                    messagebox.showinfo(
-                        "Revisión de identidades",
-                        "El conflicto detectado ya fue resuelto o dejó de estar pendiente.",
-                        parent=win,
-                    )
-                else:
-                    self.set_status("No hay conflictos de identidad pendientes", "ok")
-
-        def seleccionado():
-            items = tree.selection()
-            if not items:
-                messagebox.showwarning("Identidades", "Seleccione un conflicto.", parent=win)
-                return None
-            return registros.get(int(items[0]))
-
-        def seleccionar_ficha_destino(paciente_origen_id=None):
-            selector = Toplevel(win)
-            selector.title("Seleccionar ficha destino")
-            selector.geometry("860x520")
-            selector.minsize(720, 440)
-            selector.transient(win)
-            selector.grab_set()
-            self._bind_esc_cerrar(selector)
-            resultado = {"paciente_id": None}
-
-            cuerpo = tb.Frame(selector, padding=14, style="Root.TFrame")
-            cuerpo.pack(fill="both", expand=True)
-            tb.Label(
-                cuerpo,
-                text="Buscar ficha que se conservará",
-                font=("Arial", 15, "bold"),
-            ).pack(anchor="w", pady=(0, 4))
-            tb.Label(
-                cuerpo,
-                text="Busque por nombre, NSS, cédula o teléfono y seleccione la ficha correcta.",
-                style="Muted.TLabel",
-            ).pack(anchor="w", pady=(0, 10))
-
-            barra = tb.Frame(cuerpo, style="Root.TFrame")
-            barra.pack(fill="x", pady=(0, 10))
-            query = tk.StringVar()
-            entry = tb.Entry(barra, textvariable=query)
-            entry.pack(side="left", fill="x", expand=True, ipady=4)
-
-            columnas_destino = ("ficha", "nombre", "nss", "cedula", "telefono")
-            destino_tree = ttk.Treeview(
-                cuerpo,
-                columns=columnas_destino,
-                show="headings",
-                style="Modern.Treeview",
-            )
-            for columna, titulo, ancho in (
-                ("ficha", "Ficha", 80),
-                ("nombre", "Nombre", 280),
-                ("nss", "NSS", 130),
-                ("cedula", "Cédula", 130),
-                ("telefono", "Teléfono", 120),
-            ):
-                destino_tree.heading(columna, text=titulo)
-                destino_tree.column(columna, width=ancho, anchor="w")
-            destino_tree.pack(fill="both", expand=True)
-
-            def buscar_destinos():
-                for item in destino_tree.get_children():
-                    destino_tree.delete(item)
-                texto = query.get().strip()
-                if not texto:
-                    return
-                for ficha in self.db.buscar_pacientes_avanzado(texto, limite=80):
-                    paciente_id = int(ficha.get("paciente_id") or 0)
-                    if not paciente_id or paciente_id == int(paciente_origen_id or 0):
-                        continue
-                    destino_tree.insert(
-                        "",
-                        "end",
-                        iid=str(paciente_id),
-                        values=(
-                            f"P:{paciente_id}",
-                            ficha.get("nombre") or "",
-                            ficha.get("nss") or "",
-                            ficha.get("cedula") or "",
-                            ficha.get("telefono") or "",
-                        ),
-                    )
-
-            def elegir_destino():
-                items = destino_tree.selection()
-                if not items:
-                    messagebox.showwarning(
-                        "Ficha destino", "Seleccione una ficha de la lista.", parent=selector
-                    )
-                    return
-                resultado["paciente_id"] = int(items[0])
-                selector.destroy()
-
-            tb.Button(
-                barra, text="Buscar", bootstyle=PRIMARY, command=buscar_destinos
-            ).pack(side="left", padx=(8, 0))
-            acciones_destino = tb.Frame(cuerpo, style="Root.TFrame")
-            acciones_destino.pack(fill="x", pady=(10, 0))
-            tb.Button(
-                acciones_destino,
-                text="Seleccionar ficha",
-                bootstyle=SUCCESS,
-                command=elegir_destino,
-            ).pack(side="left")
-            tb.Button(
-                acciones_destino, text="Cancelar", command=selector.destroy
-            ).pack(side="right")
-            entry.bind("<Return>", lambda _event: buscar_destinos())
-            destino_tree.bind("<Double-1>", lambda _event: elegir_destino())
-            selector.after(80, entry.focus_set)
-            selector.wait_window()
-            return resultado["paciente_id"]
-
-        def resolver(tipo):
-            row = seleccionado()
-            if not row:
-                return
-            destino = None
-            if tipo in {"REASIGNAR_ATENCION", "FUSIONAR_FICHA"}:
-                destino = seleccionar_ficha_destino(row.get("paciente_id"))
-                if destino is None:
-                    return
-            motivo = simpledialog.askstring(
-                "Motivo de resolución",
-                "Explique la evidencia o criterio usado para esta decisión:",
-                parent=win,
-            )
-            motivo = (motivo or "").strip()
-            if len(motivo) < 8:
-                messagebox.showwarning(
-                    "Identidades", "El motivo debe tener al menos 8 caracteres.", parent=win
-                )
-                return
-            if not messagebox.askyesno(
-                "Confirmar resolución",
-                f"Conflicto #{row['id']}\nResolución: {tipo.replace('_', ' ')}\n\n¿Aplicar esta decisión?",
-                parent=win,
-            ):
-                return
-            try:
-                self.db.resolver_conflicto_identidad(
-                    int(row["id"]),
-                    tipo,
-                    actor,
-                    motivo,
-                    paciente_destino_id=destino,
-                )
-                self.security.audit(
-                    "IDENTITY_CONFLICT_RESOLVED",
-                    actor=actor,
-                    success=True,
-                    detail=f"conflicto={row['id']}; resolucion={tipo}",
-                )
-                cargar()
-                self._invalidar_caches_datos()
-                self.set_status(f"Conflicto #{row['id']} resuelto", "ok")
-            except Exception as exc:
-                APP_LOG.exception("No se pudo resolver el conflicto #%s", row["id"])
-                self.security.audit(
-                    "IDENTITY_CONFLICT_RESOLVED",
-                    actor=actor,
-                    success=False,
-                    detail=f"conflicto={row['id']}; error={exc}",
-                )
-                messagebox.showerror("Identidades", str(exc), parent=win)
-
-        def abrir_atencion():
-            row = seleccionado()
-            if row and row.get("atencion_id"):
-                self._abrir_editor_atencion(int(row["atencion_id"]))
-
-        acciones = tb.Frame(cont, style="Root.TFrame")
-        acciones.pack(fill="x", pady=(10, 0))
-        tb.Button(
-            acciones,
-            text="Mantener separados",
-            command=lambda: resolver("MANTENER_SEPARADO"),
-            bootstyle=SECONDARY,
-        ).pack(side="left", padx=(0, 6))
-        tb.Button(
-            acciones,
-            text="Reasignar atención",
-            command=lambda: resolver("REASIGNAR_ATENCION"),
-            bootstyle=WARNING,
-        ).pack(side="left", padx=6)
-        tb.Button(
-            acciones,
-            text="Fusionar ficha",
-            command=lambda: resolver("FUSIONAR_FICHA"),
-            bootstyle=DANGER,
-        ).pack(side="left", padx=6)
-        tb.Button(acciones, text="Abrir atención", command=abrir_atencion).pack(side="left", padx=6)
-        tb.Button(acciones, text="Actualizar", command=cargar).pack(side="left", padx=6)
-        tb.Button(acciones, text="Cerrar", command=win.destroy).pack(side="right")
-        cargar()
-
     def generar_pdf(self):
         salida_iniciada = False
         try:
@@ -8740,6 +8292,7 @@ class App:
                 datos_db, hoja, turno_cfg=turno_cfg
             )
             self._ultimo_atencion_id = atencion_id
+            revision_nss_id = self.db.obtener_revision_nss_atencion(atencion_id)
             comportamiento = self.app_settings.get(
                 "print_behavior_hoja", "Imprimir y abrir PDF"
             )
@@ -8762,6 +8315,13 @@ class App:
             self.limpiar_campos()
             self._restore_all_styles()
             self._refrescar_resumen_en_vivo()
+            if revision_nss_id:
+                aviso = (
+                    f"Atención #{atencion_id} guardada; la hoja continúa normalmente. "
+                    "El NSS fue enviado a revisión administrativa."
+                )
+                self.set_status(aviso, "warning")
+                self._mostrar_notificacion(aviso, autohide_ms=12000, tipo="warning")
 
         except sqlite3.IntegrityError:
             APP_LOG.exception("Se bloqueó una atención duplicada por la restricción del turno")
@@ -8770,24 +8330,6 @@ class App:
                 self._atender_duplicado_turno(duplicado)
             else:
                 messagebox.showwarning("Atención duplicada", "No se creó otra hoja para este paciente en el turno actual.")
-        except ConflictoIdentidadError as e:
-            APP_LOG.warning("Registro rechazado por conflicto de identidad: %s", e)
-            self.set_status(str(e), "warning")
-            datos_conflicto = locals().get("datos", {})
-            cedula_conflicto = datos_conflicto.get("Cédula", "")
-            conflicto_ids = self.db.obtener_o_registrar_conflictos_cedula(
-                cedula_conflicto,
-                str(e),
-            )
-            mensaje = str(e)
-            if conflicto_ids:
-                mensaje += "\n\nSe abrirá la revisión directamente en este conflicto."
-            messagebox.showwarning("No se guardó la atención", mensaje, parent=self.root)
-            if conflicto_ids:
-                self.root.after(
-                    50,
-                    lambda ids=tuple(conflicto_ids): self.abrir_revision_identidades(ids),
-                )
         except (TurnoNoVigenteError, ValueError) as e:
             APP_LOG.warning("Registro rechazado: %s", e)
             self.set_status(str(e), "warning")
@@ -10792,13 +10334,149 @@ class App:
 
         refrescar_formatos_nss()
 
+        # ---------------- TAB REVISION NSS ----------------
+        tab_revision_nss = tb.Frame(notebook, padding=12, style="Card.TFrame")
+        notebook.add(tab_revision_nss, text="Revisión NSS")
+        tab_revision_nss.columnconfigure(0, weight=1)
+        tab_revision_nss.rowconfigure(1, weight=1)
+        revision_nss_status = tk.StringVar(
+            value="Casos sin cédula cuyo NSS aparece en fichas con datos diferentes."
+        )
+        tb.Label(
+            tab_revision_nss,
+            textvariable=revision_nss_status,
+            style="Muted.TLabel",
+            wraplength=1050,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        columnas_revision = (
+            "caso","nss","ficha_nueva","paciente_nuevo","ficha_existente",
+            "paciente_existente","atencion","fecha",
+        )
+        revision_nss_tree = ttk.Treeview(
+            tab_revision_nss,
+            columns=columnas_revision,
+            show="headings",
+            style="Modern.Treeview",
+            height=14,
+        )
+        for columna, titulo, ancho in (
+            ("caso","Caso",65),("nss","NSS",130),("ficha_nueva","Ficha nueva",90),
+            ("paciente_nuevo","Paciente nuevo",210),("ficha_existente","Ficha existente",105),
+            ("paciente_existente","Paciente existente",210),("atencion","Atención",80),
+            ("fecha","Fecha",100),
+        ):
+            revision_nss_tree.heading(columna, text=titulo)
+            revision_nss_tree.column(columna, width=ancho, anchor="w")
+        revision_nss_tree.grid(row=1, column=0, sticky="nsew")
+        revisiones_nss = {}
+
+        def cargar_revisiones_nss():
+            revisiones_nss.clear()
+            revision_nss_tree.delete(*revision_nss_tree.get_children())
+            for row in self.db.listar_revisiones_nss(True, 1000):
+                revision_id = int(row["id"])
+                revisiones_nss[revision_id] = row
+                revision_nss_tree.insert(
+                    "","end",iid=str(revision_id),
+                    values=(
+                        revision_id,row.get("nss_normalizado") or "",
+                        row.get("paciente_nuevo_id") or "",row.get("nombre_nuevo") or "",
+                        row.get("paciente_referencia_id") or "",row.get("nombre_referencia") or "",
+                        row.get("atencion_id") or "",row.get("fecha") or "",
+                    ),
+                )
+            revision_nss_status.set(
+                f"{len(revisiones_nss)} caso(s) pendiente(s). Esta revisión nunca detiene la admisión."
+            )
+
+        def revision_nss_seleccionada():
+            seleccion = revision_nss_tree.selection()
+            if not seleccion:
+                messagebox.showwarning(
+                    "Revisión NSS","Seleccione un caso.",parent=win
+                )
+                return None
+            return revisiones_nss.get(int(seleccion[0]))
+
+        def resolver_nss(tipo, descripcion):
+            row = revision_nss_seleccionada()
+            if not row:
+                return
+            motivo = simpledialog.askstring(
+                "Motivo administrativo",
+                f"Acción: {descripcion}\n\nExplique el criterio utilizado:",
+                parent=win,
+            )
+            motivo = (motivo or "").strip()
+            if len(motivo) < 8:
+                messagebox.showwarning(
+                    "Revisión NSS","El motivo debe tener al menos 8 caracteres.",parent=win
+                )
+                return
+            if not messagebox.askyesno(
+                "Confirmar revisión NSS",
+                f"Caso #{row['id']} · NSS {row['nss_normalizado']}\n\n{descripcion}\n\n¿Continuar?",
+                parent=win,
+            ):
+                return
+            try:
+                actor = self._admin_authorized_actor or self._actor_actual()
+                self.db.resolver_revision_nss(int(row["id"]),tipo,actor,motivo)
+                self.security.audit(
+                    "NSS_REVIEW_RESOLVED",actor=actor,success=True,
+                    detail=f"revision={row['id']}; resolucion={tipo}",
+                )
+                cargar_revisiones_nss()
+                self._invalidar_caches_datos()
+                self.set_status(f"Revisión NSS #{row['id']} resuelta", "ok")
+            except Exception as exc:
+                APP_LOG.exception("No se pudo resolver la revisión NSS #%s", row["id"])
+                messagebox.showerror("Revisión NSS",str(exc),parent=win)
+
+        def abrir_atencion_revision_nss():
+            row = revision_nss_seleccionada()
+            if not row:
+                return
+            if not row.get("atencion_id"):
+                messagebox.showinfo(
+                    "Revisión NSS","Este caso no tiene una atención asociada.",parent=win
+                )
+                return
+            self._abrir_editor_atencion(int(row["atencion_id"]))
+
+        acciones_revision_nss = tb.Frame(tab_revision_nss, style="Card.TFrame")
+        acciones_revision_nss.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        tb.Button(
+            acciones_revision_nss,text="Conservar ambas fichas",bootstyle=SECONDARY,
+            command=lambda: resolver_nss("MANTENER_AMBOS","Conservar las dos fichas con el mismo NSS"),
+        ).pack(side="left", padx=4)
+        tb.Button(
+            acciones_revision_nss,text="Quitar NSS de ficha nueva",bootstyle=WARNING,
+            command=lambda: resolver_nss("DESVINCULAR_NSS","Retirar el NSS de la ficha y atención nuevas"),
+        ).pack(side="left", padx=4)
+        tb.Button(
+            acciones_revision_nss,text="Fusionar y eliminar duplicada",bootstyle=DANGER,
+            command=lambda: resolver_nss("FUSIONAR_CON_EXISTENTE","Fusionar con la ficha existente y eliminar la ficha duplicada"),
+        ).pack(side="left", padx=4)
+        tb.Button(
+            acciones_revision_nss,text="Abrir atención",
+            command=abrir_atencion_revision_nss,
+        ).pack(side="left", padx=4)
+        tb.Button(
+            acciones_revision_nss,text="Actualizar",command=cargar_revisiones_nss
+        ).pack(side="right", padx=4)
+        cargar_revisiones_nss()
+
         # ---------------- TAB PREFERENCIAS ----------------
         # ---------------- TAB RESPALDOS ----------------
         tab_backups = tb.Frame(notebook, padding=12, style="Card.TFrame")
         notebook.add(tab_backups, text="Respaldos")
         tab_backups.columnconfigure(0, weight=1)
         tab_backups.rowconfigure(1, weight=1)
-        backup_status = tk.StringVar(value="Respaldos verificados de la base de datos")
+        backup_status = tk.StringVar(
+            value="Respaldos verificados; se eliminan automáticamente después de 4 días"
+        )
         tb.Label(tab_backups, textvariable=backup_status, style="Muted.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
@@ -11442,6 +11120,9 @@ if __name__ == "__main__":
             missing_templates = [path for path in RUTA_HOJAS.values() if not os.path.isfile(path)]
             if missing_templates:
                 raise FileNotFoundError("Faltan plantillas: " + ", ".join(missing_templates))
+            packaged_logo = resource_path("istipo_hospitales.png")
+            if not os.path.isfile(packaged_logo):
+                raise FileNotFoundError("El logo principal no quedó incluido en el ejecutable.")
             raise SystemExit(0)
         app = App()
         app.run()
