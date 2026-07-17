@@ -1,4 +1,10 @@
-# Generador de Hojas de Emergencia 4.1.6
+# Generador de Hojas de Emergencia 4.1.7
+
+- Al editar una atención, el nombre y el sexo se guardan en el registro y el PDF archivado se regenera con los datos nuevos.
+- El formulario principal inicia y se limpia con sexo Femenino seleccionado por defecto.
+- La GUI y el Excel resuelven el mismo identificador de turno y verifican sus conteos para evitar resúmenes en cero.
+- Un Excel recuperado del mismo turno conserva su conteo visible y nunca se sobrescribe cuando la base todavía no contiene sus filas.
+- Los conflictos de NSS detectados durante una edición se envían a Revisión NSS sin impedir el guardado ni la generación del documento.
 
 - Al actualizar el NSS de una ficha con cedula se elimina el vinculo anterior y solo queda vigente el NSS nuevo.
 - Si un NSS sin cedula aparece con nombre y telefono diferentes, la atencion y la hoja continúan sin interrupcion.

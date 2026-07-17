@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(4, 1, 6, 0),
-    prodvers=(4, 1, 6, 0),
+    filevers=(4, 1, 7, 0),
+    prodvers=(4, 1, 7, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'Hospital Provincial Dr. Angel Contreras'),
           StringStruct(u'FileDescription', u'Generador de formularios de emergencia'),
-          StringStruct(u'FileVersion', u'4.1.6.0'),
+          StringStruct(u'FileVersion', u'4.1.7.0'),
           StringStruct(u'InternalName', u'GeneradorHojasEmergencia'),
           StringStruct(u'OriginalFilename', u'GENERADOR DE HOJAS 4.1.exe'),
           StringStruct(u'ProductName', u'Sistema de Formularios de Emergencia'),
-          StringStruct(u'ProductVersion', u'4.1.6')
+          StringStruct(u'ProductVersion', u'4.1.7')
         ]
       )
     ]),
