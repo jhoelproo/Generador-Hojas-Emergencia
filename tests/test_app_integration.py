@@ -207,3 +207,161 @@ def test_nss_without_cedula_keeps_flow_and_creates_admin_review(tmp_path, monkey
     assert merged["es_reingreso"] == 1
     assert merged["atencion_origen_id"] == first_id
     assert manager.listar_revisiones_nss(True) == []
+
+
+def test_edit_attention_updates_sex_and_invalidates_old_pdf(tmp_path, monkeypatch):
+    module = load_application(tmp_path, monkeypatch)
+    manager = module.DatabaseManager()
+    shift = valid_shift(module)
+    attention_id = manager.guardar_atencion(patient_data(), "GENERAL", shift)
+
+    old_pdf = tmp_path / "old.pdf"
+    old_pdf.write_bytes(b"%PDF-1.4 old snapshot")
+    manager.registrar_documento(
+        attention_id, "HOJA_EMERGENCIA", str(old_pdf), "GENERAL"
+    )
+    manager.actualizar_trabajo_salida(
+        attention_id,
+        "pdf",
+        "COMPLETADO",
+        pdf_path=str(old_pdf),
+        pdf_sha256="old",
+    )
+
+    edited = patient_data(
+        Nombre="PACIENTE NOMBRE ACTUALIZADO",
+        Sexo="Femenino",
+    )
+    edited.update({"Hoja": "GENERAL"})
+    assert manager.actualizar_atencion_especifica(attention_id, edited) == 1
+
+    current = manager.obtener_atencion_por_id(attention_id)
+    assert current["nombre"] == "PACIENTE NOMBRE ACTUALIZADO"
+    assert current["sexo"] == "Femenino"
+    assert manager.obtener_documento_atencion(attention_id) is None
+    output = manager.obtener_trabajo_salida(attention_id)
+    assert output["pdf_estado"] == "PENDIENTE"
+    assert output["pdf_path"] is None
+    assert output["pdf_sha256"] is None
+
+    regenerated = module.regenerar_pdf_archivado(manager, attention_id)
+    assert regenerated
+    text = "\n".join(
+        page.extract_text() or "" for page in module.PdfReader(regenerated).pages
+    )
+    assert "PACIENTE NOMBRE ACTUALIZADO" in text
+    assert "Femenino" in text
+
+
+def test_edit_nss_conflict_is_logged_without_blocking(tmp_path, monkeypatch):
+    module = load_application(tmp_path, monkeypatch)
+    manager = module.DatabaseManager()
+    shift = valid_shift(module)
+    first_id = manager.guardar_atencion(
+        patient_data(
+            Nombre="REFERENCIA NSS",
+            Cédula="",
+            NSS="111222333",
+            Teléfono="8095550301",
+        ),
+        "GENERAL",
+        shift,
+    )
+    second_id = manager.guardar_atencion(
+        patient_data(
+            Nombre="PACIENTE EDITABLE",
+            Cédula="",
+            NSS="777888999",
+            Teléfono="8095550302",
+        ),
+        "GENERAL",
+        shift,
+    )
+    edited = patient_data(
+        Nombre="PACIENTE EDITABLE",
+        Sexo="Femenino",
+        Cédula="",
+        NSS="111222333",
+        Teléfono="8095550302",
+    )
+    edited["Hoja"] = "GENERAL"
+
+    assert manager.actualizar_atencion_especifica(second_id, edited) == 1
+    current = manager.obtener_atencion_por_id(second_id)
+    assert current["identidad_estado"] == "NSS_EN_REVISION"
+    assert current["requiere_revision"] == 1
+    revisions = manager.listar_revisiones_nss(True)
+    revision = next(row for row in revisions if row["atencion_id"] == second_id)
+    assert revision["paciente_referencia_id"] == manager.obtener_atencion_por_id(
+        first_id
+    )["paciente_id"]
+
+
+def test_gui_summary_and_excel_use_same_turn_after_start_time_changes(tmp_path, monkeypatch):
+    module = load_application(tmp_path, monkeypatch)
+    manager = module.DatabaseManager()
+    shift = valid_shift(module)
+    for index in range(85):
+        manager.guardar_atencion(
+            patient_data(
+                Nombre=f"PACIENTE LISTADO {index:03d}",
+                Cédula=f"001{index:08d}",
+                NSS=f"9{index:08d}",
+                Teléfono=f"80955{index:05d}",
+            ),
+            "GENERAL",
+            shift,
+        )
+
+    shifted = dict(shift)
+    shifted["inicio_real_dt"] = shift["inicio_real_dt"].replace(
+        minute=(shift["inicio_real_dt"].minute + 1) % 60
+    )
+    context = manager.buscar_contexto_turno_existente(shifted)
+    assert context is not None
+
+    module.guardar_turno_config(
+        shifted["representante"],
+        shifted["turno_codigo"],
+        shifted["fecha_base"],
+        shifted["inicio_real_dt"],
+    )
+    assert module.reconstruir_excel_turno(manager, shifted) == 85
+    summary = manager.resumen_turno_actual()
+    assert summary["total"] == 85
+    assert module.resumen_excel_actual_simple(shifted)["total"] == 85
+
+
+def test_gui_uses_matching_recovered_excel_instead_of_showing_zero(
+    tmp_path, monkeypatch
+):
+    module = load_application(tmp_path, monkeypatch)
+    manager = module.DatabaseManager()
+    shift = valid_shift(module)
+    module.guardar_turno_config(
+        shift["representante"],
+        shift["turno_codigo"],
+        shift["fecha_base"],
+        shift["inicio_real_dt"],
+    )
+    module.verificar_o_crear_excel()
+    workbook = module.openpyxl.load_workbook(module.EXCEL_PATH)
+    sheet = workbook.active
+    visual = module.obtener_datos_turno_visual(
+        shift["fecha_base"], shift["turno_codigo"]
+    )
+    sheet["A3"] = (
+        f"{shift['representante']} {visual['fecha_label']}"
+    )
+    sheet["A4"] = visual["turno_label"]
+    for index in range(80):
+        sheet.append(
+            [index + 1, f"PACIENTE RECUPERADO {index:03d}", "GENERAL", "SENASA"]
+        )
+    workbook.save(module.EXCEL_PATH)
+    workbook.close()
+
+    summary = manager.resumen_turno_actual()
+    assert summary["total"] == 80
+    assert summary["GENERAL"] == 80
+    assert summary["_fuente"] == "EXCEL_RECUPERADO"

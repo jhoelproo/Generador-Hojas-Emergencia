@@ -19,7 +19,7 @@ $updaterSpecPath = [System.IO.Path]::GetFullPath((Join-Path $repo "ACTUALIZADOR.
 $lockPath = Join-Path $repo "requirements.lock"
 $assetManifest = Join-Path $PSScriptRoot "assets.sha256"
 $exeName = "GENERADOR DE HOJAS 4.1.exe"
-$releaseName = "GENERADOR_DE_HOJAS_4.1.6"
+$releaseName = "GENERADOR_DE_HOJAS_4.1.7"
 
 function Assert-PathInsideRepo([string]$Path) {
     $full = [System.IO.Path]::GetFullPath($Path)

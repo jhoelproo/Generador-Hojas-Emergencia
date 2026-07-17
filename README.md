@@ -2,7 +2,7 @@
 
 Aplicacion de escritorio para registrar atenciones de emergencia, generar la hoja clinica, actualizar el listado del turno e imprimir dentro del flujo operativo del hospital.
 
-## Version 4.1.6
+## Version 4.1.7
 
 - Pacientes, atenciones, dias operativos y turnos tienen relaciones trazables.
 - Se bloquean duplicados dentro del mismo dia operativo y se permiten reingresos autorizados.

@@ -1,6 +1,6 @@
 # facturacion_tabs.py
 # Sistema de Formularios de Emergencia - Hospital General
-# Version: 4.1.6 - Historial NSS por cedula y revision NSS aislada
+# Version: 4.1.7 - PDF editable, sexo femenino por defecto y listados coherentes
 # Python 3.14 compatible
 import os
 import re
@@ -1648,6 +1648,24 @@ class DatabaseManager:
                     normalizar_turno_codigo(turno_cfg.get("turno_codigo", "8AM_8AM")),
                 ),
             ).fetchone()
+            if not row:
+                # La hora real puede variar si la configuración fue recuperada o
+                # guardada nuevamente. El día y el tipo identifican el mismo turno.
+                row = conn.execute(
+                    """
+                    SELECT t.id AS turno_id,t.dia_operativo_id,t.fecha_inicio,t.fecha_fin,
+                           t.representante,t.tipo_turno,t.estado,d.fecha_base
+                    FROM turnos t
+                    JOIN dias_operativos d ON d.id=t.dia_operativo_id
+                    WHERE d.fecha_base=? AND t.tipo_turno=?
+                    ORDER BY CASE WHEN t.estado='ABIERTO' THEN 0 ELSE 1 END,t.id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        turno_cfg["fecha_base"].isoformat(),
+                        normalizar_turno_codigo(turno_cfg.get("turno_codigo", "8AM_8AM")),
+                    ),
+                ).fetchone()
         return dict(row) if row else None
 
     def cerrar_turno_existente(self, turno_cfg, momento_cierre=None):
@@ -3239,6 +3257,9 @@ class DatabaseManager:
         telefono_db = telefono if telefono.isdigit() and len(telefono) == 10 else None
         direccion = (nuevos.get("Dirección") or "").strip()
         nacionalidad = (nuevos.get("Nacionalidad") or "").strip()
+        sexo = (nuevos.get("Sexo") or "").strip()
+        if sexo not in ("Masculino", "Femenino"):
+            raise ValueError("El sexo debe ser Masculino o Femenino.")
         edad_num = int(nuevos.get("Edad_num", 0) or 0)
         unidad = (nuevos.get("Unidad") or "Años").strip()
         tipo_atencion = (nuevos.get("TipoAtencion") or "EMERGENCIA").strip().upper()
@@ -3266,18 +3287,81 @@ class DatabaseManager:
                 identificadores.append(("NSS", nss_clean))
             if is_valid_cedula_key(cedula_clean):
                 identificadores.append(("CEDULA", cedula_clean))
+            revision_nss = None
+            if not is_valid_cedula_key(cedula_clean) and is_valid_nss_key(nss_clean):
+                revision_nss = cur.execute(
+                    """
+                    SELECT p.id,p.nombre
+                    FROM paciente_identificadores i
+                    JOIN pacientes p ON p.id=i.paciente_id
+                    WHERE i.tipo='NSS' AND i.valor_normalizado=?
+                      AND i.activo=1 AND p.id<>?
+                    ORDER BY i.conflicto,p.id DESC LIMIT 1
+                    """,
+                    (nss_clean, paciente_id),
+                ).fetchone()
+            nss_clean_atencion = None if revision_nss else (nss_clean or None)
+            identidad_estado = "NSS_EN_REVISION" if revision_nss else "VALIDADA"
             cur.execute("""
                 UPDATE atenciones
-                SET nombre=?, fecha=?, hora=?, hoja=?, ars=?, nss=?, cedula=?, telefono=?, direccion=?, nacionalidad=?,
+                SET nombre=?, sexo=?, fecha=?, hora=?, hoja=?, ars=?, nss=?, cedula=?, telefono=?, direccion=?, nacionalidad=?,
                     edad_num=?, unidad=?, tipo_atencion=?, nss_clean=?, cedula_clean=?, telefono_clean=?,
                     identidad_estado=?, requiere_revision=?,
                     updated_at=datetime('now','localtime')
                 WHERE id=?
-            """, (nombre, fecha, hora, hoja, ars, nss, cedula, telefono, direccion, nacionalidad,
-                  edad_num, unidad, tipo_atencion, nss_clean or None,
-                  cedula_clean or None, telefono_clean or None, "VALIDADA",
-                  0, int(atencion_id)))
+            """, (nombre, sexo, fecha, hora, hoja, ars, nss, cedula, telefono, direccion, nacionalidad,
+                  edad_num, unidad, tipo_atencion, nss_clean_atencion,
+                  cedula_clean or None, telefono_clean or None, identidad_estado,
+                  int(bool(revision_nss)), int(atencion_id)))
             rowcount = cur.rowcount
+
+            # Una edición tampoco debe detener el flujo. Si queda un NSS sin
+            # cédula compartido con otra ficha, se registra para revisión superior.
+            cur.execute(
+                """
+                UPDATE nss_conflictos SET
+                    estado='RESUELTO',resolucion='CORREGIDO_EN_EDICION',
+                    motivo_resolucion='La atención fue editada posteriormente',
+                    resuelto_por='SISTEMA',resuelto_at=datetime('now','localtime')
+                WHERE atencion_id=? AND estado='PENDIENTE'
+                """,
+                (int(atencion_id),),
+            )
+            if revision_nss:
+                detalle = (
+                    f"NSS compartido tras edición con la ficha "
+                    f"#{int(revision_nss['id'])} ({revision_nss['nombre'] or 'SIN NOMBRE'})."
+                )
+                cur.execute(
+                    """
+                    INSERT INTO nss_conflictos(
+                        nss_normalizado,paciente_nuevo_id,paciente_referencia_id,
+                        atencion_id,detalle
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        nss_clean,
+                        paciente_id,
+                        int(revision_nss["id"]),
+                        int(atencion_id),
+                        detalle,
+                    ),
+                )
+            # El PDF archivado representa el snapshot anterior. Se invalida en la
+            # misma transacción para impedir que vuelva a abrirse desactualizado.
+            cur.execute(
+                "DELETE FROM documentos WHERE atencion_id=? AND tipo='HOJA_EMERGENCIA'",
+                (int(atencion_id),),
+            )
+            cur.execute(
+                """
+                UPDATE trabajos_salida SET
+                    pdf_estado='PENDIENTE',pdf_path=NULL,pdf_sha256=NULL,
+                    ultimo_error=NULL,updated_at=datetime('now','localtime')
+                WHERE atencion_id=?
+                """,
+                (int(atencion_id),),
+            )
 
             if actualizar_ficha:
                 for tipo, valor in identificadores:
@@ -3376,12 +3460,17 @@ class DatabaseManager:
 
 
     def resumen_turno_actual(self):
-        turno_cfg = cargar_turno_config()
+        turno_cfg = cargar_turno_config() or cargar_turno_config(permitir_vencido=True)
         base = {"total": 0, "sin_seguro": 0, "GENERAL": 0, "PEDIATRIA": 0, "GINECOLOGIA": 0, "URGENCIAS": 0}
         if not turno_cfg:
             return base
         contexto = self.buscar_contexto_turno_existente(turno_cfg)
         if not contexto:
+            excel = resumen_excel_actual_simple(turno_cfg=turno_cfg)
+            if int(excel.get("total", 0) or 0):
+                excel["URGENCIAS"] = 0
+                excel["_fuente"] = "EXCEL_RECUPERADO"
+                return excel
             return base
         filas = self.obtener_atenciones_para_rango_real(
             turno_id=int(contexto["turno_id"])
@@ -3399,6 +3488,17 @@ class DatabaseManager:
             hoja = (f.get("hoja", "") or "").upper()
             if hoja in resumen:
                 resumen[hoja] += 1
+        resumen["_fuente"] = "BD"
+
+        # Si se recuperó un Excel del mismo turno y contiene más filas que la BD,
+        # se conserva visible su conteo en vez de presentar un cero engañoso.
+        excel = resumen_excel_actual_simple(turno_cfg=turno_cfg)
+        if int(excel.get("total", 0) or 0) > int(resumen.get("total", 0) or 0):
+            excel["URGENCIAS"] = resumen.get("URGENCIAS", 0)
+            excel["_fuente"] = "EXCEL_RECUPERADO"
+            return excel
+        if int(excel.get("total", 0) or 0) == int(resumen.get("total", 0) or 0):
+            resumen["_fuente"] = "BD_EXCEL"
         return resumen
 
     def obtener_atenciones_para_reporte(self, fecha_inicio=None, fecha_fin=None):
@@ -3753,7 +3853,12 @@ def reconstruir_excel_turno(db: DatabaseManager, turno_cfg: dict):
 
     datos_turno = obtener_datos_turno_visual(turno_cfg["fecha_base"], turno_cfg["turno_codigo"])
     inicio, fin = obtener_rango_turno_efectivo(turno_cfg)
-    filas = db.obtener_atenciones_para_rango_real(inicio, fin)
+    contexto = db.buscar_contexto_turno_existente(turno_cfg)
+    filas = db.obtener_atenciones_para_rango_real(
+        fecha_inicio=None if contexto else inicio,
+        fecha_fin=None if contexto else fin,
+        turno_id=int(contexto["turno_id"]) if contexto else None,
+    )
 
     if os.path.exists(EXCEL_PATH):
         wb = abrir_excel_workbook_seguro(EXCEL_PATH, mostrar_error=False)
@@ -4016,7 +4121,7 @@ def imprimir_pdf(ruta_pdf, copias=1, mostrar_error=False):
             )
         return False
 
-def resumen_excel_actual_simple():
+def resumen_excel_actual_simple(turno_cfg=None):
     resumen = {
         "total": 0,
         "sin_seguro": 0,
@@ -4030,6 +4135,23 @@ def resumen_excel_actual_simple():
 
         wb = abrir_excel_workbook_seguro(EXCEL_PATH, read_only=True, data_only=True)
         ws = wb.active
+
+        if turno_cfg:
+            encabezado_fecha = str(ws["A3"].value or "")
+            encabezado_turno = str(ws["A4"].value or "")
+            fecha_esperada = turno_cfg["fecha_base"].strftime("%d/%m/%Y")
+            turno_esperado = normalizar_turno_codigo(
+                turno_cfg.get("turno_codigo", "8AM_8AM")
+            )
+            if (
+                fecha_esperada not in encabezado_fecha
+                or normalizar_turno_codigo(encabezado_turno) != turno_esperado
+            ):
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+                return resumen
 
         for fila in range(6, ws.max_row + 1):
             nombre = str(ws.cell(row=fila, column=2).value or "").strip()
@@ -4382,6 +4504,50 @@ def archivar_pdf_atencion(ruta_temporal, atencion_id, fecha=None):
     shutil.copy2(ruta_temporal, temporal_destino)
     os.replace(temporal_destino, destino)
     return destino
+
+
+def regenerar_pdf_archivado(db: DatabaseManager, atencion_id: int, mostrar_error=False):
+    """Regenera el PDF desde el snapshot vigente y actualiza su referencia íntegra."""
+    atencion = db.obtener_atencion_por_id(int(atencion_id))
+    if not atencion or str(atencion.get("estado") or "").upper() != "ACTIVA":
+        return None
+    datos = {
+        "Fecha": atencion.get("fecha", ""),
+        "Hora": atencion.get("hora", ""),
+        "Nombre": atencion.get("nombre", ""),
+        "Sexo": atencion.get("sexo", "") or "Femenino",
+        "Edad_num": int(atencion.get("edad_num") or 0),
+        "Unidad": atencion.get("unidad", "Años"),
+        "Cédula": atencion.get("cedula", ""),
+        "Teléfono": atencion.get("telefono", "") or "",
+        "Dirección": atencion.get("direccion", ""),
+        "Nacionalidad": atencion.get("nacionalidad", ""),
+        "Aseguradora (ARS)": atencion.get("ars", ""),
+        "NSS": atencion.get("nss", ""),
+        "TipoAtencion": atencion.get("tipo_atencion", "EMERGENCIA"),
+    }
+    hoja = atencion.get("hoja") or "GENERAL"
+    ruta_temporal = crear_pdf_temporal(hoja, datos, mostrar_error=mostrar_error)
+    if not ruta_temporal:
+        return None
+    try:
+        ruta = archivar_pdf_atencion(ruta_temporal, int(atencion_id))
+        sha256 = db.registrar_documento(
+            int(atencion_id), "HOJA_EMERGENCIA", ruta, hoja
+        )
+        db.actualizar_trabajo_salida(
+            int(atencion_id),
+            "pdf",
+            "COMPLETADO",
+            pdf_path=ruta,
+            pdf_sha256=sha256,
+        )
+        return ruta
+    finally:
+        try:
+            os.remove(ruta_temporal)
+        except OSError:
+            pass
 
 
 def eliminar_archivo_sensible(ruta):
@@ -5048,7 +5214,7 @@ class App:
         self.entry_nombre.grid(row=3, column=0, columnspan=3, sticky="ew", padx=(4, 24), pady=(0, 10), ipady=6)
 
         self.lbl_sexo = lbl("Sexo", 2, 3, 2)
-        self.var_sexo = tk.StringVar(value="")
+        self.var_sexo = tk.StringVar(value="Femenino")
         
         sexo_frame = tb.Frame(self.frame)
         self.sexo_frame = sexo_frame
@@ -5314,7 +5480,31 @@ class App:
     def _reconstruir_excel_inicio_diferido(self, turno_cfg):
         try:
             verificar_o_crear_excel()
-            self.set_status("Inicio rápido: Excel verificado", "ok")
+            contexto = self.db.buscar_contexto_turno_existente(turno_cfg)
+            filas_bd = (
+                self.db.obtener_atenciones_para_rango_real(
+                    turno_id=int(contexto["turno_id"])
+                )
+                if contexto
+                else []
+            )
+            filas_excel = int(
+                resumen_excel_actual_simple(turno_cfg).get("total", 0) or 0
+            )
+            if filas_bd:
+                reconstruir_excel_turno(self.db, turno_cfg)
+                self.set_status(
+                    f"Listado verificado: {len(filas_bd)} paciente(s) sincronizados.",
+                    "ok",
+                )
+            elif filas_excel:
+                self.set_status(
+                    f"Listado recuperado: {filas_excel} paciente(s) visibles; "
+                    "no se sobrescribió el Excel.",
+                    "warning",
+                )
+            else:
+                self.set_status("Inicio rápido: Excel verificado", "ok")
             self._actualizar_turno_visual_en_vivo()
             self._refrescar_resumen_en_vivo()
         except PermissionError:
@@ -6385,9 +6575,13 @@ class App:
     def _actualizar_resumen_turno_panel(self, forzar=False):
         try:
             r = self._obtener_resumen_turno_cache(forzar=forzar)
-            fuente = "BD rápida"
-            if os.path.exists(EXCEL_PATH):
-                fuente = "BD rápida · Excel disponible"
+            fuente = "Base de datos"
+            if r.get("_fuente") == "BD_EXCEL":
+                fuente = "BD y Excel sincronizados"
+            elif os.path.exists(EXCEL_PATH):
+                fuente = "BD · Excel pendiente de actualización"
+            if r.get("_fuente") == "EXCEL_RECUPERADO":
+                fuente = "Excel recuperado · revisión de sincronización"
 
             if not bool(self.app_settings.get("show_turno_summary", True)):
                 texto = "Resumen oculto por preferencias."
@@ -7559,7 +7753,7 @@ class App:
             self.entry_nacionalidad.delete(0, tk.END); self.entry_nacionalidad.insert(0, form.get("nacionalidad", ""))
             self.entry_ars.delete(0, tk.END);          self.entry_ars.insert(0, form.get("ars", ""))
             self.entry_nss.delete(0, tk.END);          self.entry_nss.insert(0, form.get("nss", ""))
-            self.var_sexo.set(form.get("sexo", "Masculino"))
+            self.var_sexo.set(form.get("sexo") or "Femenino")
             self.var_embarazada.set(form.get("embarazada", False))
             self.var_urgencia.set(form.get("urgencia", False))
 
@@ -7613,7 +7807,7 @@ class App:
         self.entry_nacionalidad.delete(0, tk.END)
         self.entry_ars.delete(0, tk.END)
         self.entry_nss.delete(0, tk.END)
-        self.var_sexo.set("")
+        self.var_sexo.set("Femenino")
         self.var_embarazada.set(False)
         try:
             self.var_urgencia.set(False)
@@ -8798,7 +8992,7 @@ class App:
             "Fecha": atencion["fecha"],
             "Hora": atencion["hora"],
             "Nombre": atencion["nombre"],
-            "Sexo": atencion.get("sexo", ""),
+            "Sexo": atencion.get("sexo", "") or "Femenino",
             "Edad_num": int(atencion.get("edad_num") or 0),
             "Unidad": atencion.get("unidad", "Años"),
             "Cédula": atencion.get("cedula", ""),
@@ -8828,21 +9022,13 @@ class App:
             abrir_pdf(documento["ruta"])
             return
 
-        datos = self._snapshot_a_datos(atencion)
-        hoja = atencion.get("hoja", "GENERAL")
-        ruta_temporal = crear_pdf_temporal(hoja, datos, mostrar_error=False)
-        if not ruta_temporal:
+        ruta = regenerar_pdf_archivado(
+            self.db, atencion_id, mostrar_error=False
+        )
+        if not ruta:
             messagebox.showerror("PDF", "No se pudo recuperar ni reconstruir el documento.")
             return
-        try:
-            ruta = archivar_pdf_atencion(ruta_temporal, atencion_id)
-            self.db.registrar_documento(atencion_id, "HOJA_EMERGENCIA", ruta, hoja)
-            abrir_pdf(ruta)
-        finally:
-            try:
-                os.remove(ruta_temporal)
-            except OSError:
-                pass
+        abrir_pdf(ruta)
 
     def eliminar_atencion_seleccionada(self, tree, reordenar_ids=False, refrescar_callback=None):
         sel = tree.selection()
@@ -9172,6 +9358,7 @@ class App:
         campos = {}
         campos_def = [
             ("Nombre", at.get("nombre", ""), "entry"),
+            ("Sexo", at.get("sexo", "Femenino") or "Femenino", "sexo"),
             ("Fecha", at.get("fecha", ""), "entry"),
             ("Hora", at.get("hora", ""), "entry"),
             ("Hoja", at.get("hoja", ""), "hoja"),
@@ -9208,6 +9395,20 @@ class App:
                 var = tk.StringVar(value=(value or "EMERGENCIA").upper())
                 ent = tb.Combobox(form, textvariable=var, state="readonly", values=["EMERGENCIA", "URGENCIA"])
                 ent.after_idle(lambda ent=ent, v=(value or "EMERGENCIA"): ent.current(["EMERGENCIA", "URGENCIA"].index(v.upper())))
+            elif kind == "sexo":
+                val_sexo = value if value in ["Masculino", "Femenino"] else "Femenino"
+                var = tk.StringVar(value=val_sexo)
+                ent = tb.Combobox(
+                    form,
+                    textvariable=var,
+                    state="readonly",
+                    values=["Femenino", "Masculino"],
+                )
+                ent.after_idle(
+                    lambda ent=ent, v=val_sexo: ent.current(
+                        ["Femenino", "Masculino"].index(v)
+                    )
+                )
             else:
                 ent = tb.Entry(form)
                 ent.insert(0, value or "")
@@ -9270,6 +9471,7 @@ class App:
 
             nuevos = {
                 "Nombre": _get("Nombre"),
+                "Sexo": _get("Sexo") or "Femenino",
                 "Fecha": _get("Fecha"),
                 "Hora": _get("Hora"),
                 "Hoja": hoja,
@@ -9287,11 +9489,16 @@ class App:
             try:
                 snapshot_antes = dict(at)
                 self.db.actualizar_atencion_especifica(atencion_id, nuevos)
+                ruta_pdf_actualizada = regenerar_pdf_archivado(
+                    self.db, atencion_id, mostrar_error=False
+                )
+                revision_nss_id = self.db.obtener_revision_nss_atencion(atencion_id)
                 self._invalidar_cache_ars()
 
                 def _undo_edit_atencion():
                     datos_anteriores = {
                         "Nombre": snapshot_antes.get("nombre", ""),
+                        "Sexo": snapshot_antes.get("sexo", "Femenino") or "Femenino",
                         "Fecha": snapshot_antes.get("fecha", ""),
                         "Hora": snapshot_antes.get("hora", ""),
                         "Hoja": snapshot_antes.get("hoja", ""),
@@ -9306,6 +9513,9 @@ class App:
                         "Nacionalidad": snapshot_antes.get("nacionalidad", ""),
                     }
                     self.db.actualizar_atencion_especifica(atencion_id, datos_anteriores)
+                    regenerar_pdf_archivado(
+                        self.db, atencion_id, mostrar_error=False
+                    )
                     turno_cfg_undo = cargar_turno_config()
                     if turno_cfg_undo:
                         reconstruir_excel_turno(self.db, turno_cfg_undo)
@@ -9326,7 +9536,20 @@ class App:
                     on_saved()
 
                 self._mostrar_notificacion(f"Atención #{atencion_id} actualizada. Ctrl+Z para deshacer.", on_undo=_undo_edit_atencion, autohide_ms=5000)
-                messagebox.showinfo("Guardado", "Atención actualizada correctamente.")
+                if revision_nss_id:
+                    self._mostrar_notificacion(
+                        f"Atención #{atencion_id} actualizada. El conflicto NSS "
+                        "fue enviado a revisión administrativa sin detener el flujo.",
+                        autohide_ms=12000,
+                        tipo="warning",
+                    )
+                mensaje_guardado = "Atención y PDF actualizados correctamente."
+                if not ruta_pdf_actualizada:
+                    mensaje_guardado = (
+                        "Atención actualizada. El PDF quedó pendiente y se "
+                        "reconstruirá automáticamente al abrirlo."
+                    )
+                messagebox.showinfo("Guardado", mensaje_guardado)
                 try:
                     win.destroy()
                 except Exception:
