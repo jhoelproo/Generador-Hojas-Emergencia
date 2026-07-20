@@ -1,6 +1,6 @@
 # facturacion_tabs.py
 # Sistema de Formularios de Emergencia - Hospital General
-# Version: 4.1.8 - Usuarios de turno administrables y escritura libre
+# Version: 4.1.9 - Panel moderno de usuarios y turnos siempre manuales
 # Python 3.14 compatible
 import os
 import re
@@ -911,7 +911,7 @@ def es_representante_valido(valor: str) -> bool:
     return bool(limpio and limpio.upper() not in REPRESENTANTES_NO_VALIDOS)
 
 
-def cargar_representantes(db=None):
+def cargar_representantes(db=None, incluir_actual=True):
     nombres = set()
     catalogo_existente = os.path.exists(REPRESENTANTES_PATH)
     try:
@@ -925,13 +925,14 @@ def cargar_representantes(db=None):
     except Exception:
         APP_LOG.exception("No se pudo leer el catálogo de representantes")
 
-    try:
-        cfg = cargar_turno_config(permitir_vencido=True)
-        actual = limpiar_nombre_representante((cfg or {}).get("representante", ""))
-        if es_representante_valido(actual):
-            nombres.add(actual)
-    except Exception:
-        APP_LOG.exception("No se pudo recuperar el representante del turno actual")
+    if incluir_actual:
+        try:
+            cfg = cargar_turno_config(permitir_vencido=True)
+            actual = limpiar_nombre_representante((cfg or {}).get("representante", ""))
+            if es_representante_valido(actual):
+                nombres.add(actual)
+        except Exception:
+            APP_LOG.exception("No se pudo recuperar el representante del turno actual")
 
     # La BD histórica solo se usa para inicializar el catálogo una vez. Después,
     # un usuario eliminado no debe reaparecer por existir en turnos antiguos.
@@ -1298,65 +1299,15 @@ def guardar_turno_config(representante: str, turno_codigo: str, fecha_base: date
         return False
 
 
-def crear_turno_desde_excel_existente_si_aplica() -> bool:
+def excel_requiere_turno_manual() -> bool:
+    """Detecta un listado conservado sin crear ni cambiar turnos automáticamente."""
     try:
-        if os.path.exists(TURNOS_CFG):
+        if cargar_turno_config(permitir_vencido=True):
             return False
-
-        if not os.path.exists(EXCEL_PATH):
-            return False
-
-        if not excel_tiene_registros(EXCEL_PATH):
-            return False
-
-        representante = ""
-        turno_codigo = "8AM_8AM"
-        fecha_base = datetime.now().date()
-
-        try:
-            wb = abrir_excel_workbook_seguro(EXCEL_PATH, read_only=True, data_only=True)
-            ws = wb.active
-
-            a3 = str(ws["A3"].value or "").strip()
-            a4 = str(ws["A4"].value or "").strip()
-
-            if a4:
-                turno_codigo = normalizar_turno_codigo(a4)
-
-            m = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", a3)
-            if m:
-                f = parse_fecha_ddmmyyyy(m.group(1))
-                if f:
-                    fecha_base = f
-
-            rep_limpio = limpiar_nombre_representante(a3)
-            if es_representante_valido(rep_limpio):
-                representante = rep_limpio
-
-            try:
-                wb.close()
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-        hora_inicio = time(20, 0) if normalizar_turno_codigo(turno_codigo) == "8PM_8AM" else time(8, 0)
-        inicio_real = datetime.combine(fecha_base, hora_inicio)
-
-        if not es_representante_valido(representante):
-            APP_LOG.warning(
-                "El Excel existente no contiene un representante válido; "
-                "se conservará sin crear una configuración de turno."
-            )
-            return False
-
-        return guardar_turno_config(
-            representante=representante,
-            turno_codigo=turno_codigo,
-            fecha_base=fecha_base,
-            inicio_real=inicio_real
+        return bool(
+            os.path.exists(EXCEL_PATH)
+            and excel_tiene_registros(EXCEL_PATH)
         )
-
     except Exception:
         return False
 
@@ -5088,7 +5039,7 @@ class App:
         self.app_settings = cargar_app_settings()
         self._asegurar_preferencias_impresion_hoja()
         verificar_o_crear_excel()
-        self._turno_creado_desde_excel_existente = crear_turno_desde_excel_existente_si_aplica()
+        self._excel_pendiente_turno_manual = excel_requiere_turno_manual()
 
         self._temp_files = set()
         self._updating_period_dates = False
@@ -5550,14 +5501,14 @@ class App:
         except Exception:
             pass
 
-        if turno_cfg and not getattr(self, "_turno_creado_desde_excel_existente", False):
+        if turno_cfg:
             try:
                 self.root.after(1200, lambda cfg=turno_cfg: self._reconstruir_excel_inicio_diferido(cfg))
             except Exception:
                 pass
-        elif getattr(self, "_turno_creado_desde_excel_existente", False):
+        elif getattr(self, "_excel_pendiente_turno_manual", False):
             try:
-                self.set_status("Turno recuperado desde Excel existente; no se reconstruyó para conservar datos.", "ok")
+                self.root.after(1200, self._avisar_turno_manual_pendiente)
             except Exception:
                 pass
 
@@ -5620,6 +5571,14 @@ class App:
             self.set_status("Excel abierto. Cierre el listado para actualizarlo.", "warning")
         except Exception as e:
             self.set_status(f"Aviso al verificar Excel: {e}", "warning")
+
+    def _avisar_turno_manual_pendiente(self):
+        aviso = (
+            "El Excel conserva pacientes, pero no hay un turno configurado. "
+            "El listado no fue modificado; use Cambiar turno para confirmarlo manualmente."
+        )
+        self.set_status(aviso, "warning")
+        self._mostrar_notificacion(aviso, autohide_ms=15000, tipo="warning")
 
     def _paleta_visual_actual(self):
         """
@@ -10925,43 +10884,128 @@ class App:
         # ---------------- TAB USUARIOS ----------------
         tab_usuarios = tb.Frame(notebook, padding=12, style="Card.TFrame")
         notebook.add(tab_usuarios, text="Usuarios")
-        tab_usuarios.columnconfigure(0, weight=1)
-        tab_usuarios.rowconfigure(2, weight=1)
+        tab_usuarios.columnconfigure(0, weight=3)
+        tab_usuarios.columnconfigure(1, weight=2)
+        tab_usuarios.rowconfigure(1, weight=1)
 
         usuarios_estado = tk.StringVar(
-            value="Administra los nombres disponibles para representar cada turno."
+            value="Catálogo de representantes y corrección segura del turno actual."
         )
         tb.Label(
             tab_usuarios,
             textvariable=usuarios_estado,
             style="Muted.TLabel",
             background="#0E1B2B",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        usuario_var = tk.StringVar()
-        usuario_form = tb.Frame(tab_usuarios, style="Card.TFrame")
-        usuario_form.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        usuario_form.columnconfigure(1, weight=1)
+        catalogo_card = tb.Frame(
+            tab_usuarios, padding=14, style="Root.TFrame"
+        )
+        catalogo_card.grid(
+            row=1, column=0, sticky="nsew", padx=(0, 8)
+        )
+        catalogo_card.columnconfigure(0, weight=1)
+        catalogo_card.rowconfigure(2, weight=1)
         tb.Label(
-            usuario_form,
-            text="Nombre del representante:",
-            background="#0E1B2B",
-        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
-        usuario_entry = tb.Entry(usuario_form, textvariable=usuario_var)
-        usuario_entry.grid(row=0, column=1, sticky="ew", ipady=4)
+            catalogo_card,
+            text="CATÁLOGO DE USUARIOS",
+            font=("Arial", 13, "bold"),
+            foreground="#FFFFFF",
+            background="#07111f",
+        ).grid(row=0, column=0, sticky="w")
+        tb.Label(
+            catalogo_card,
+            text=(
+                "Nombres disponibles como sugerencias al abrir un turno. "
+                "Añadir o editar no cambia el turno actual."
+            ),
+            style="Muted.TLabel",
+            background="#07111f",
+            wraplength=590,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(3, 10))
 
         usuarios_tree = ttk.Treeview(
-            tab_usuarios,
-            columns=("nombre", "estado"),
+            catalogo_card,
+            columns=("nombre",),
             show="headings",
-            height=13,
+            height=12,
             style="Modern.Treeview",
         )
         usuarios_tree.heading("nombre", text="Representante")
-        usuarios_tree.heading("estado", text="Uso")
         usuarios_tree.column("nombre", width=520, anchor="w")
-        usuarios_tree.column("estado", width=170, anchor="center")
         usuarios_tree.grid(row=2, column=0, sticky="nsew")
+
+        turno_card = tb.Frame(
+            tab_usuarios, padding=16, style="Root.TFrame"
+        )
+        turno_card.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+        turno_card.columnconfigure(0, weight=1)
+        tb.Label(
+            turno_card,
+            text="TURNO ACTUAL",
+            font=("Arial", 13, "bold"),
+            foreground="#FFFFFF",
+            background="#07111f",
+        ).grid(row=0, column=0, sticky="w")
+        tb.Label(
+            turno_card,
+            text="● ACTIVO",
+            font=("Arial", 9, "bold"),
+            foreground="#72E39B",
+            background="#07111f",
+        ).grid(row=0, column=1, sticky="e")
+
+        tb.Label(
+            turno_card,
+            text="Representante registrado",
+            style="Muted.TLabel",
+            background="#07111f",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(18, 3))
+        usuario_turno_nombre_var = tk.StringVar(value="No configurado")
+        tb.Label(
+            turno_card,
+            textvariable=usuario_turno_nombre_var,
+            font=("Arial", 16, "bold"),
+            foreground="#5CB6FF",
+            background="#07111f",
+            wraplength=390,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=2, sticky="w")
+
+        usuario_turno_detalle_var = tk.StringVar(value="")
+        tb.Label(
+            turno_card,
+            textvariable=usuario_turno_detalle_var,
+            background="#07111f",
+            foreground="#EAF2FF",
+            wraplength=390,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 18))
+
+        proteccion_card = tb.Frame(turno_card, padding=12, style="Card.TFrame")
+        proteccion_card.grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=(0, 14)
+        )
+        tb.Label(
+            proteccion_card,
+            text="Corrección sin efectos clínicos",
+            font=("Arial", 10, "bold"),
+            foreground="#72E39B",
+            background="#0E1B2B",
+        ).pack(anchor="w")
+        tb.Label(
+            proteccion_card,
+            text=(
+                "Solo cambia la GUI, el encabezado del Excel y el nombre del "
+                "reporte PDF cuando se genere. No imprime, no reinicia el turno "
+                "y no modifica pacientes ni atenciones."
+            ),
+            style="Muted.TLabel",
+            background="#0E1B2B",
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
 
         def usuario_actual():
             cfg = cargar_turno_config(permitir_vencido=True) or {}
@@ -10971,15 +11015,24 @@ class App:
         def cargar_usuarios():
             usuarios_tree.delete(*usuarios_tree.get_children())
             actual = usuario_actual()
-            nombres = cargar_representantes(self.db)
+            nombres = cargar_representantes(self.db, incluir_actual=False)
             for indice, nombre in enumerate(nombres):
-                estado = "Turno actual" if nombre.casefold() == actual.casefold() else "Disponible"
                 usuarios_tree.insert(
-                    "", "end", iid=f"usuario-{indice}", values=(nombre, estado)
+                    "", "end", iid=f"usuario-{indice}", values=(nombre,)
+                )
+            cfg = cargar_turno_config(permitir_vencido=True) or {}
+            usuario_turno_nombre_var.set(actual or "No configurado")
+            if cfg:
+                usuario_turno_detalle_var.set(
+                    f"{descripcion_turno_config(cfg)}\n"
+                    f"Fecha operativa: {cfg['fecha_base'].strftime('%d/%m/%Y')}"
+                )
+            else:
+                usuario_turno_detalle_var.set(
+                    "No existe un turno configurado para corregir."
                 )
             usuarios_estado.set(
-                f"{len(nombres)} usuario(s). "
-                + (f"Turno actual: {actual}" if actual else "El turno no tiene un representante válido.")
+                f"{len(nombres)} usuario(s) disponible(s) en el catálogo."
             )
 
         def usuario_seleccionado():
@@ -10987,44 +11040,6 @@ class App:
             if not seleccion:
                 return ""
             return str(usuarios_tree.item(seleccion[0], "values")[0]).strip()
-
-        def seleccionar_usuario(_evento=None):
-            nombre = usuario_seleccionado()
-            if nombre:
-                usuario_var.set(nombre)
-
-        def validar_usuario_entrada():
-            nombre = limpiar_nombre_representante(usuario_var.get())
-            if not es_representante_valido(nombre):
-                messagebox.showwarning(
-                    "Usuarios",
-                    "Escriba un nombre válido. 'No disponible' no se admite.",
-                    parent=win,
-                )
-                usuario_entry.focus_set()
-                return ""
-            return nombre
-
-        def agregar_usuario():
-            nombre = validar_usuario_entrada()
-            if not nombre:
-                return
-            nombres = cargar_representantes(self.db)
-            if nombre.casefold() in {item.casefold() for item in nombres}:
-                usuarios_estado.set("Ese usuario ya existe; puede seleccionarlo en la lista.")
-                return
-            nombres.append(nombre)
-            if not guardar_catalogo_representantes(nombres):
-                messagebox.showerror("Usuarios", "No se pudo guardar el catálogo.", parent=win)
-                return
-            self.security.audit(
-                "SHIFT_USER_ADDED",
-                actor=self._admin_authorized_actor or self._actor_actual(),
-                success=True,
-                detail=nombre,
-            )
-            usuario_var.set("")
-            cargar_usuarios()
 
         def aplicar_usuario_turno(nombre):
             actualizado = actualizar_representante_turno_actual(self.db, nombre)
@@ -11039,54 +11054,166 @@ class App:
             cargar_usuarios()
             return actualizado
 
-        def editar_usuario():
-            anterior = usuario_seleccionado()
-            nuevo = validar_usuario_entrada()
-            if not anterior or not nuevo:
-                if not anterior:
+        def abrir_dialogo_nombre(titulo, descripcion, inicial, al_guardar):
+            dialogo = Toplevel(win)
+            dialogo.title(titulo)
+            dialogo.geometry("560x300")
+            dialogo.minsize(520, 280)
+            dialogo.transient(win)
+            dialogo.grab_set()
+            dialogo.configure(bg="#07111f")
+            self._bind_esc_cerrar(dialogo)
+
+            contenido = tb.Frame(dialogo, padding=18, style="Root.TFrame")
+            contenido.pack(fill="both", expand=True)
+            tb.Label(
+                contenido,
+                text=titulo,
+                font=("Arial", 16, "bold"),
+                foreground="#FFFFFF",
+                background="#07111f",
+            ).pack(anchor="w")
+            tb.Label(
+                contenido,
+                text=descripcion,
+                style="Muted.TLabel",
+                background="#07111f",
+                wraplength=510,
+                justify="left",
+            ).pack(anchor="w", pady=(4, 16))
+
+            campo_card = tb.Frame(contenido, padding=12, style="Card.TFrame")
+            campo_card.pack(fill="x")
+            tb.Label(
+                campo_card,
+                text="Nombre completo del representante",
+                background="#0E1B2B",
+                font=("Arial", 10, "bold"),
+            ).pack(anchor="w", pady=(0, 5))
+            nombre_var = tk.StringVar(value=inicial or "")
+            entrada = tb.Entry(campo_card, textvariable=nombre_var)
+            entrada.pack(fill="x", ipady=6)
+
+            def guardar_dialogo():
+                nombre = limpiar_nombre_representante(nombre_var.get())
+                if not es_representante_valido(nombre):
                     messagebox.showwarning(
-                        "Usuarios", "Seleccione el usuario que desea editar.", parent=win
+                        titulo,
+                        "Escriba un nombre válido. 'No disponible' no se admite.",
+                        parent=dialogo,
                     )
-                return
-            nombres = cargar_representantes(self.db)
-            if (
-                nuevo.casefold() != anterior.casefold()
-                and nuevo.casefold() in {item.casefold() for item in nombres}
-            ):
-                messagebox.showwarning(
-                    "Usuarios", "Ya existe otro usuario con ese nombre.", parent=win
-                )
-                return
-            if anterior.casefold() == usuario_actual().casefold():
+                    entrada.focus_set()
+                    return
                 try:
-                    aplicar_usuario_turno(nuevo)
+                    if al_guardar(nombre) is False:
+                        return
+                    dialogo.grab_release()
+                    dialogo.destroy()
                 except PermissionError:
                     messagebox.showwarning(
                         "Excel abierto",
                         "Cierre el listado de Excel y vuelva a intentarlo. "
-                        "No se modificó el usuario activo.",
+                        "No se realizó ningún cambio.",
+                        parent=dialogo,
+                    )
+                except Exception as exc:
+                    APP_LOG.exception("No se pudo guardar el representante")
+                    messagebox.showerror(titulo, str(exc), parent=dialogo)
+
+            botones = tb.Frame(contenido, style="Root.TFrame")
+            botones.pack(side="bottom", fill="x", pady=(16, 0))
+            tb.Button(
+                botones,
+                text="Guardar cambios",
+                bootstyle=SUCCESS,
+                command=guardar_dialogo,
+                width=20,
+            ).pack(side="left")
+            tb.Button(
+                botones,
+                text="Cancelar",
+                bootstyle=SECONDARY,
+                command=dialogo.destroy,
+                width=12,
+            ).pack(side="right")
+            entrada.bind("<Return>", lambda _event: guardar_dialogo())
+            dialogo.after(80, lambda: (entrada.focus_set(), entrada.selection_range(0, tk.END)))
+
+        def agregar_usuario():
+            def guardar_nuevo(nombre):
+                nombres = cargar_representantes(self.db, incluir_actual=False)
+                if nombre.casefold() in {item.casefold() for item in nombres}:
+                    messagebox.showinfo(
+                        "Nuevo usuario",
+                        "Ese usuario ya existe en el catálogo.",
                         parent=win,
                     )
-                    return
-                except Exception as exc:
-                    APP_LOG.exception("No se pudo editar el usuario del turno")
-                    messagebox.showerror("Usuarios", str(exc), parent=win)
-                    return
-            actualizados = [
-                nuevo if item.casefold() == anterior.casefold() else item
-                for item in nombres
-            ]
-            if not guardar_catalogo_representantes(actualizados):
-                messagebox.showerror("Usuarios", "No se pudo editar el catálogo.", parent=win)
-                return
-            self.security.audit(
-                "SHIFT_USER_RENAMED",
-                actor=self._admin_authorized_actor or self._actor_actual(),
-                success=True,
-                detail=f"{anterior}->{nuevo}",
+                    return False
+                nombres.append(nombre)
+                if not guardar_catalogo_representantes(nombres):
+                    raise OSError("No se pudo guardar el catálogo.")
+                self.security.audit(
+                    "SHIFT_USER_ADDED",
+                    actor=self._admin_authorized_actor or self._actor_actual(),
+                    success=True,
+                    detail=nombre,
+                )
+                cargar_usuarios()
+                return True
+
+            abrir_dialogo_nombre(
+                "Nuevo usuario",
+                "Añade un nombre a las sugerencias. Esto no cambia el turno actual.",
+                "",
+                guardar_nuevo,
             )
-            usuario_var.set(nuevo)
-            cargar_usuarios()
+
+        def editar_usuario():
+            anterior = usuario_seleccionado()
+            if not anterior:
+                messagebox.showwarning(
+                    "Editar usuario",
+                    "Seleccione primero un usuario de la lista.",
+                    parent=win,
+                )
+                return
+
+            def guardar_edicion(nuevo):
+                nombres = cargar_representantes(self.db, incluir_actual=False)
+                if (
+                    nuevo.casefold() != anterior.casefold()
+                    and nuevo.casefold() in {item.casefold() for item in nombres}
+                ):
+                    messagebox.showwarning(
+                        "Editar usuario",
+                        "Ya existe otro usuario con ese nombre.",
+                        parent=win,
+                    )
+                    return False
+                actualizados = [
+                    nuevo if item.casefold() == anterior.casefold() else item
+                    for item in nombres
+                ]
+                if not guardar_catalogo_representantes(actualizados):
+                    raise OSError("No se pudo editar el catálogo.")
+                self.security.audit(
+                    "SHIFT_USER_RENAMED",
+                    actor=self._admin_authorized_actor or self._actor_actual(),
+                    success=True,
+                    detail=f"{anterior}->{nuevo}",
+                )
+                cargar_usuarios()
+                return True
+
+            abrir_dialogo_nombre(
+                "Editar usuario",
+                (
+                    "Modifica únicamente el nombre guardado en el catálogo. "
+                    "El representante del turno actual se corrige en el panel separado."
+                ),
+                anterior,
+                guardar_edicion,
+            )
 
         def eliminar_usuario():
             nombre = usuario_seleccionado()
@@ -11111,7 +11238,7 @@ class App:
             ):
                 return
             nombres = [
-                item for item in cargar_representantes(self.db)
+                item for item in cargar_representantes(self.db, incluir_actual=False)
                 if item.casefold() != nombre.casefold()
             ]
             if not guardar_catalogo_representantes(nombres):
@@ -11123,56 +11250,66 @@ class App:
                 success=True,
                 detail=nombre,
             )
-            usuario_var.set("")
             cargar_usuarios()
 
-        def usar_usuario_actual():
-            nombre = usuario_seleccionado() or validar_usuario_entrada()
-            if not nombre:
-                return
-            if not messagebox.askyesno(
-                "Cambiar representante",
-                f"¿Usar '{nombre}' en el turno actual?\n\n"
-                "Solo cambiarán el encabezado del Excel, los reportes futuros y "
-                "el nombre mostrado en la GUI. Los pacientes no se modificarán.",
-                parent=win,
-            ):
-                return
-            try:
+        def corregir_turno_actual():
+            actual = usuario_actual()
+
+            def guardar_correccion(nombre):
+                if nombre.casefold() == actual.casefold():
+                    messagebox.showinfo(
+                        "Corregir turno actual",
+                        "Ese nombre ya está asignado al turno actual.",
+                        parent=win,
+                    )
+                    return False
                 aplicar_usuario_turno(nombre)
                 messagebox.showinfo(
-                    "Usuarios",
-                    "Representante actualizado sin modificar pacientes ni atenciones.",
+                    "Turno actualizado",
+                    "Se corrigió el representante sin imprimir ni modificar "
+                    "pacientes o atenciones.",
                     parent=win,
                 )
-            except PermissionError:
-                messagebox.showwarning(
-                    "Excel abierto",
-                    "Cierre el listado de Excel y vuelva a intentarlo. No se cambió el usuario.",
-                    parent=win,
-                )
-            except Exception as exc:
-                APP_LOG.exception("No se pudo cambiar el representante del turno")
-                messagebox.showerror("Usuarios", str(exc), parent=win)
+                return True
 
-        usuarios_tree.bind("<<TreeviewSelect>>", seleccionar_usuario)
-        usuarios_acciones = tb.Frame(tab_usuarios, style="Card.TFrame")
+            abrir_dialogo_nombre(
+                "Corregir representante del turno",
+                (
+                    "Corrige un nombre ingresado por error. No cierra el turno, "
+                    "no genera ni imprime documentos y conserva todos los pacientes."
+                ),
+                actual,
+                guardar_correccion,
+            )
+
+        usuarios_tree.bind("<Double-1>", lambda _event: editar_usuario())
+        usuarios_acciones = tb.Frame(catalogo_card, style="Root.TFrame")
         usuarios_acciones.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         tb.Button(
-            usuarios_acciones, text="Añadir", command=agregar_usuario, bootstyle=SUCCESS
-        ).pack(side="left", padx=4)
-        tb.Button(
-            usuarios_acciones, text="Editar", command=editar_usuario, bootstyle=INFO
-        ).pack(side="left", padx=4)
-        tb.Button(
-            usuarios_acciones, text="Eliminar", command=eliminar_usuario, bootstyle=DANGER
+            usuarios_acciones,
+            text="+  Nuevo usuario",
+            command=agregar_usuario,
+            bootstyle=SUCCESS,
         ).pack(side="left", padx=4)
         tb.Button(
             usuarios_acciones,
-            text="Usar en turno actual",
-            command=usar_usuario_actual,
+            text="✎  Editar seleccionado",
+            command=editar_usuario,
+            bootstyle=INFO,
+        ).pack(side="left", padx=4)
+        tb.Button(
+            usuarios_acciones,
+            text="Eliminar",
+            command=eliminar_usuario,
+            bootstyle=DANGER,
+        ).pack(side="left", padx=4)
+        tb.Button(
+            turno_card,
+            text="Corregir representante del turno",
+            command=corregir_turno_actual,
             bootstyle=PRIMARY,
-        ).pack(side="right", padx=4)
+            width=30,
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", ipady=6)
         cargar_usuarios()
 
         # ---------------- TAB PREFERENCIAS ----------------

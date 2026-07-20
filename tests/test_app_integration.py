@@ -395,6 +395,20 @@ def test_representative_catalog_rejects_placeholders_and_honors_deletions(
     # del catálogo administrado.
     assert module.cargar_representantes(manager) == ["MARIA PEREZ"]
 
+    assert module.guardar_turno_config(
+        "REPRESENTANTE ACTUAL",
+        shift["turno_codigo"],
+        shift["fecha_base"],
+        shift["inicio_real_dt"],
+    )
+    assert module.cargar_representantes(
+        manager, incluir_actual=False
+    ) == ["MARIA PEREZ"]
+    assert module.cargar_representantes(manager) == [
+        "MARIA PEREZ",
+        "REPRESENTANTE ACTUAL",
+    ]
+
 
 def test_change_current_representative_only_updates_turn_headers_and_reports(
     tmp_path, monkeypatch
@@ -443,3 +457,29 @@ def test_change_current_representative_only_updates_turn_headers_and_reports(
     report_summary = module.construir_resumen_turno(manager, after_config)
     assert report_summary["representante"] == "REPRESENTANTE CORREGIDA"
     assert report_summary["total_general"] == 1
+
+
+def test_saturday_excel_never_creates_or_changes_shift_automatically(
+    tmp_path, monkeypatch
+):
+    module = load_application(tmp_path, monkeypatch)
+    module.DatabaseManager()
+    module.verificar_o_crear_excel()
+    workbook = module.openpyxl.load_workbook(module.EXCEL_PATH)
+    sheet = workbook.active
+    sheet["A3"] = "REPRESENTANTE SABADO 18/07/2026 AL 19/07/2026"
+    sheet["A4"] = "DESDE 8:00 AM A 8:00 PM"
+    sheet.append([1, "PACIENTE CONSERVADO", "GENERAL", "SENASA"])
+    workbook.save(module.EXCEL_PATH)
+    workbook.close()
+
+    assert not module.os.path.exists(module.TURNOS_CFG)
+    assert module.excel_requiere_turno_manual() is True
+    assert not module.os.path.exists(module.TURNOS_CFG)
+    assert module.cargar_turno_config(permitir_vencido=True) is None
+
+    workbook = module.openpyxl.load_workbook(
+        module.EXCEL_PATH, read_only=True, data_only=True
+    )
+    assert workbook.active["B6"].value == "PACIENTE CONSERVADO"
+    workbook.close()
