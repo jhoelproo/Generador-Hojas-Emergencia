@@ -365,3 +365,81 @@ def test_gui_uses_matching_recovered_excel_instead_of_showing_zero(
     assert summary["total"] == 80
     assert summary["GENERAL"] == 80
     assert summary["_fuente"] == "EXCEL_RECUPERADO"
+
+
+def test_representative_catalog_rejects_placeholders_and_honors_deletions(
+    tmp_path, monkeypatch
+):
+    module = load_application(tmp_path, monkeypatch)
+    manager = module.DatabaseManager()
+    shift = valid_shift(module)
+    manager.obtener_contexto_turno(shift)
+
+    assert module.es_representante_valido("María Pérez")
+    assert not module.es_representante_valido("No disponible")
+    assert not module.es_representante_valido("Nombre del representante")
+    assert module.guardar_turno_config(
+        "No disponible",
+        shift["turno_codigo"],
+        shift["fecha_base"],
+        shift["inicio_real_dt"],
+    ) is False
+
+    assert module.guardar_catalogo_representantes(
+        ["MARIA PEREZ", "ANA LOPEZ", "NO DISPONIBLE"]
+    )
+    assert module.cargar_representantes(manager) == ["ANA LOPEZ", "MARIA PEREZ"]
+
+    assert module.guardar_catalogo_representantes(["MARIA PEREZ"])
+    # Los nombres históricos de la BD no vuelven a aparecer después de eliminarse
+    # del catálogo administrado.
+    assert module.cargar_representantes(manager) == ["MARIA PEREZ"]
+
+
+def test_change_current_representative_only_updates_turn_headers_and_reports(
+    tmp_path, monkeypatch
+):
+    module = load_application(tmp_path, monkeypatch)
+    manager = module.DatabaseManager()
+    shift = valid_shift(module)
+    module.guardar_turno_config(
+        shift["representante"],
+        shift["turno_codigo"],
+        shift["fecha_base"],
+        shift["inicio_real_dt"],
+    )
+    attention_id = manager.guardar_atencion(patient_data(), "GENERAL", shift)
+    module.reconstruir_excel_turno(manager, shift)
+    before_attention = manager.obtener_atencion_por_id(attention_id)
+    before_config = module.cargar_turno_config(permitir_vencido=True)
+
+    updated = module.actualizar_representante_turno_actual(
+        manager, "REPRESENTANTE CORREGIDA"
+    )
+
+    after_attention = manager.obtener_atencion_por_id(attention_id)
+    after_config = module.cargar_turno_config(permitir_vencido=True)
+    context = manager.buscar_contexto_turno_existente(after_config)
+    with manager._connect() as connection:
+        db_representative = connection.execute(
+            "SELECT representante FROM turnos WHERE id=?",
+            (context["turno_id"],),
+        ).fetchone()[0]
+
+    assert updated["representante"] == "REPRESENTANTE CORREGIDA"
+    assert after_config["representante"] == "REPRESENTANTE CORREGIDA"
+    assert after_config["inicio_real"] == before_config["inicio_real"]
+    assert db_representative == "REPRESENTANTE CORREGIDA"
+    assert after_attention == before_attention
+
+    workbook = module.openpyxl.load_workbook(
+        module.EXCEL_PATH, read_only=True, data_only=True
+    )
+    sheet = workbook.active
+    assert "REPRESENTANTE CORREGIDA" in str(sheet["A3"].value)
+    assert str(sheet["B6"].value) == patient_data()["Nombre"]
+    workbook.close()
+
+    report_summary = module.construir_resumen_turno(manager, after_config)
+    assert report_summary["representante"] == "REPRESENTANTE CORREGIDA"
+    assert report_summary["total_general"] == 1

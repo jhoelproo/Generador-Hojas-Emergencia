@@ -1,6 +1,6 @@
 # facturacion_tabs.py
 # Sistema de Formularios de Emergencia - Hospital General
-# Version: 4.1.7 - PDF editable, sexo femenino por defecto y listados coherentes
+# Version: 4.1.8 - Usuarios de turno administrables y escritura libre
 # Python 3.14 compatible
 import os
 import re
@@ -897,59 +897,82 @@ def limpiar_nombre_representante(valor: str) -> str:
     return txt
 
 
+REPRESENTANTES_NO_VALIDOS = {
+    "NO DISPONIBLE",
+    "NO CONFIGURADO",
+    "NOMBRE DEL REPRESENTANTE",
+    "NOMBRE REPRESENTANTE",
+    "SIN REPRESENTANTE",
+}
+
+
+def es_representante_valido(valor: str) -> bool:
+    limpio = limpiar_nombre_representante(valor)
+    return bool(limpio and limpio.upper() not in REPRESENTANTES_NO_VALIDOS)
+
+
 def cargar_representantes(db=None):
     nombres = set()
+    catalogo_existente = os.path.exists(REPRESENTANTES_PATH)
     try:
-        if os.path.exists(REPRESENTANTES_PATH):
+        if catalogo_existente:
             with open(REPRESENTANTES_PATH, "r", encoding="utf-8") as archivo:
                 data = json.load(archivo)
             for nombre in data if isinstance(data, list) else []:
                 limpio = limpiar_nombre_representante(nombre)
-                if limpio:
+                if es_representante_valido(limpio):
                     nombres.add(limpio)
     except Exception:
         APP_LOG.exception("No se pudo leer el catálogo de representantes")
 
     try:
-        cfg = cargar_turno_config()
+        cfg = cargar_turno_config(permitir_vencido=True)
         actual = limpiar_nombre_representante((cfg or {}).get("representante", ""))
-        if actual and actual.upper() != "NOMBRE DEL REPRESENTANTE":
+        if es_representante_valido(actual):
             nombres.add(actual)
     except Exception:
         APP_LOG.exception("No se pudo recuperar el representante del turno actual")
 
-    if db is not None:
+    # La BD histórica solo se usa para inicializar el catálogo una vez. Después,
+    # un usuario eliminado no debe reaparecer por existir en turnos antiguos.
+    if db is not None and not catalogo_existente:
         try:
-            nombres.update(db.listar_representantes())
+            nombres.update(
+                nombre for nombre in db.listar_representantes()
+                if es_representante_valido(nombre)
+            )
         except Exception:
             APP_LOG.exception("No se pudieron consultar representantes históricos")
 
     return sorted(nombres, key=lambda valor: valor.casefold())
 
 
+def guardar_catalogo_representantes(nombres) -> bool:
+    limpios = {}
+    for nombre in nombres or []:
+        limpio = limpiar_nombre_representante(nombre)
+        if es_representante_valido(limpio):
+            limpios.setdefault(limpio.casefold(), limpio)
+    try:
+        atomic_write_json(
+            REPRESENTANTES_PATH,
+            sorted(limpios.values(), key=lambda valor: valor.casefold()),
+        )
+        return True
+    except (OSError, TypeError, ValueError):
+        APP_LOG.exception("No se pudo guardar el catálogo de representantes")
+        return False
+
+
 def guardar_representante_catalogo(nombre: str, db=None):
     limpio = limpiar_nombre_representante(nombre)
-    if not limpio or limpio.upper() == "NOMBRE DEL REPRESENTANTE":
-        return limpio
+    if not es_representante_valido(limpio):
+        return ""
 
     nombres = cargar_representantes(db)
     if limpio.casefold() not in {valor.casefold() for valor in nombres}:
         nombres.append(limpio)
-    nombres = sorted(nombres, key=lambda valor: valor.casefold())
-
-    temporal = f"{REPRESENTANTES_PATH}.tmp"
-    try:
-        with open(temporal, "w", encoding="utf-8") as archivo:
-            json.dump(nombres, archivo, ensure_ascii=False, indent=2)
-        os.replace(temporal, REPRESENTANTES_PATH)
-    except Exception:
-        APP_LOG.exception("No se pudo guardar el catálogo de representantes")
-        try:
-            if os.path.exists(temporal):
-                os.remove(temporal)
-        except Exception:
-            pass
-    return limpio
+    return limpio if guardar_catalogo_representantes(nombres) else ""
 
 def descripcion_turno_config(turno_cfg: dict) -> str:
     if not turno_cfg:
@@ -1234,8 +1257,11 @@ def cargar_turno_config(permitir_vencido=False):
 
         inicio_real_dt = parse_datetime_local(data.get("inicio_real", ""))
 
+        representante = limpiar_nombre_representante(data.get("representante", ""))
+        if not es_representante_valido(representante):
+            representante = ""
         config = {
-            "representante": limpiar_nombre_representante(data.get("representante", "")),
+            "representante": representante,
             "turno_codigo": normalizar_turno_codigo(data.get("turno_codigo", "8AM_8AM")),
             "fecha_base": fecha_base,
             "inicio_real": data.get("inicio_real", ""),
@@ -1252,8 +1278,15 @@ def cargar_turno_config(permitir_vencido=False):
 
 def guardar_turno_config(representante: str, turno_codigo: str, fecha_base: date, inicio_real: datetime = None):
     try:
+        representante = limpiar_nombre_representante(representante)
+        if not es_representante_valido(representante):
+            APP_LOG.warning(
+                "Se rechazó un representante inválido para el turno: %r",
+                representante,
+            )
+            return False
         payload = {
-            "representante": limpiar_nombre_representante(representante),
+            "representante": representante,
             "turno_codigo": normalizar_turno_codigo(turno_codigo),
             "fecha_base": fecha_base.strftime("%d/%m/%Y"),
             "inicio_real": format_datetime_local(inicio_real or datetime.now()),
@@ -1276,7 +1309,7 @@ def crear_turno_desde_excel_existente_si_aplica() -> bool:
         if not excel_tiene_registros(EXCEL_PATH):
             return False
 
-        representante = "NOMBRE DEL REPRESENTANTE"
+        representante = ""
         turno_codigo = "8AM_8AM"
         fecha_base = datetime.now().date()
 
@@ -1297,7 +1330,7 @@ def crear_turno_desde_excel_existente_si_aplica() -> bool:
                     fecha_base = f
 
             rep_limpio = limpiar_nombre_representante(a3)
-            if rep_limpio:
+            if es_representante_valido(rep_limpio):
                 representante = rep_limpio
 
             try:
@@ -1310,13 +1343,19 @@ def crear_turno_desde_excel_existente_si_aplica() -> bool:
         hora_inicio = time(20, 0) if normalizar_turno_codigo(turno_codigo) == "8PM_8AM" else time(8, 0)
         inicio_real = datetime.combine(fecha_base, hora_inicio)
 
-        guardar_turno_config(
+        if not es_representante_valido(representante):
+            APP_LOG.warning(
+                "El Excel existente no contiene un representante válido; "
+                "se conservará sin crear una configuración de turno."
+            )
+            return False
+
+        return guardar_turno_config(
             representante=representante,
             turno_codigo=turno_codigo,
             fecha_base=fecha_base,
             inicio_real=inicio_real
         )
-        return True
 
     except Exception:
         return False
@@ -1522,13 +1561,36 @@ class DatabaseManager:
                 "SELECT DISTINCT representante FROM turnos "
                 "WHERE TRIM(IFNULL(representante,'')) <> '' ORDER BY representante"
             ).fetchall()
-        return [limpiar_nombre_representante(fila[0]) for fila in filas if limpiar_nombre_representante(fila[0])]
+        return [
+            limpiar_nombre_representante(fila[0])
+            for fila in filas
+            if es_representante_valido(fila[0])
+        ]
+
+    def actualizar_representante_turno(self, turno_id: int, representante: str) -> bool:
+        representante = limpiar_nombre_representante(representante)
+        if not es_representante_valido(representante):
+            raise ValueError(
+                "Escriba un nombre de representante válido; 'No disponible' no se admite."
+            )
+        with closing(self._connect()) as conn:
+            cur = conn.execute(
+                """
+                UPDATE turnos SET representante=?,updated_at=datetime('now','localtime')
+                WHERE id=?
+                """,
+                (representante, int(turno_id)),
+            )
+            conn.commit()
+            return cur.rowcount == 1
 
     def obtener_o_crear_turno(self, turno_cfg, conn=None):
         if not turno_cfg or not turno_config_es_vigente(turno_cfg):
             raise TurnoNoVigenteError("Debe abrir un turno vigente antes de registrar atenciones.")
         inicio, fin = obtener_rango_turno_efectivo(turno_cfg)
-        representante = limpiar_nombre_representante(turno_cfg.get("representante", "")) or "NOMBRE DEL REPRESENTANTE"
+        representante = limpiar_nombre_representante(turno_cfg.get("representante", ""))
+        if not es_representante_valido(representante):
+            raise ValueError("El turno requiere un representante válido.")
         tipo = normalizar_turno_codigo(turno_cfg.get("turno_codigo", "8AM_8AM"))
         fecha_base = turno_cfg["fecha_base"]
         dia_inicio = datetime.combine(fecha_base, time(8, 0))
@@ -3917,6 +3979,53 @@ def reconstruir_excel_turno(db: DatabaseManager, turno_cfg: dict):
             pass
         raise
     return numero - 1
+
+
+def actualizar_representante_turno_actual(
+    db: DatabaseManager,
+    representante: str,
+) -> dict:
+    """Cambia solo el responsable del turno, su encabezado y reportes futuros."""
+    representante = limpiar_nombre_representante(representante)
+    if not es_representante_valido(representante):
+        raise ValueError(
+            "Escriba un nombre válido. 'No disponible' no puede guardarse como usuario."
+        )
+    turno_cfg = cargar_turno_config(permitir_vencido=True)
+    if not turno_cfg:
+        raise TurnoNoVigenteError("No existe un turno configurado para actualizar.")
+    contexto = db.buscar_contexto_turno_existente(turno_cfg)
+    if not contexto:
+        raise TurnoNoVigenteError("No se encontró el turno asociado a la configuración.")
+
+    datos_turno = obtener_datos_turno_visual(
+        turno_cfg["fecha_base"], turno_cfg["turno_codigo"]
+    )
+    # Se comprueba primero que el Excel pueda actualizarse. Si está abierto, no
+    # se modifica la configuración ni la base y el operador puede reintentar.
+    actualizar_encabezado_excel(
+        representante,
+        datos_turno["turno_label"],
+        datos_turno["fecha_label"],
+    )
+    inicio_real = turno_cfg.get("inicio_real_dt")
+    if not guardar_turno_config(
+        representante,
+        turno_cfg["turno_codigo"],
+        turno_cfg["fecha_base"],
+        inicio_real=inicio_real,
+    ):
+        raise OSError("No se pudo actualizar la configuración del turno.")
+    if not db.actualizar_representante_turno(
+        int(contexto["turno_id"]), representante
+    ):
+        raise RuntimeError("No se pudo actualizar el representante en el turno.")
+
+    guardar_representante_catalogo(representante, db)
+    actualizado = cargar_turno_config(permitir_vencido=True) or dict(turno_cfg)
+    actualizado["representante"] = representante
+    actualizado["turno_id"] = int(contexto["turno_id"])
+    return actualizado
 
 
 def agregar_excel_temporal(nombre, especialidad, ars_canonico):
@@ -10184,7 +10293,7 @@ class App:
         self._crear_header_ventana(
             cont,
             "Configuración interna",
-            "Administra ARS, alias, formato visual del NSS en PDF y preferencias de la aplicación.",
+            "Administra ARS, usuarios de turno, respaldos, revisión NSS y preferencias.",
             "⚙"
         )
 
@@ -10813,6 +10922,260 @@ class App:
         tb.Button(backup_actions, text="Restaurar", command=restaurar_respaldo_ui, bootstyle=DANGER).pack(side="left", padx=4)
         refrescar_respaldos()
 
+        # ---------------- TAB USUARIOS ----------------
+        tab_usuarios = tb.Frame(notebook, padding=12, style="Card.TFrame")
+        notebook.add(tab_usuarios, text="Usuarios")
+        tab_usuarios.columnconfigure(0, weight=1)
+        tab_usuarios.rowconfigure(2, weight=1)
+
+        usuarios_estado = tk.StringVar(
+            value="Administra los nombres disponibles para representar cada turno."
+        )
+        tb.Label(
+            tab_usuarios,
+            textvariable=usuarios_estado,
+            style="Muted.TLabel",
+            background="#0E1B2B",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        usuario_var = tk.StringVar()
+        usuario_form = tb.Frame(tab_usuarios, style="Card.TFrame")
+        usuario_form.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        usuario_form.columnconfigure(1, weight=1)
+        tb.Label(
+            usuario_form,
+            text="Nombre del representante:",
+            background="#0E1B2B",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        usuario_entry = tb.Entry(usuario_form, textvariable=usuario_var)
+        usuario_entry.grid(row=0, column=1, sticky="ew", ipady=4)
+
+        usuarios_tree = ttk.Treeview(
+            tab_usuarios,
+            columns=("nombre", "estado"),
+            show="headings",
+            height=13,
+            style="Modern.Treeview",
+        )
+        usuarios_tree.heading("nombre", text="Representante")
+        usuarios_tree.heading("estado", text="Uso")
+        usuarios_tree.column("nombre", width=520, anchor="w")
+        usuarios_tree.column("estado", width=170, anchor="center")
+        usuarios_tree.grid(row=2, column=0, sticky="nsew")
+
+        def usuario_actual():
+            cfg = cargar_turno_config(permitir_vencido=True) or {}
+            nombre = limpiar_nombre_representante(cfg.get("representante", ""))
+            return nombre if es_representante_valido(nombre) else ""
+
+        def cargar_usuarios():
+            usuarios_tree.delete(*usuarios_tree.get_children())
+            actual = usuario_actual()
+            nombres = cargar_representantes(self.db)
+            for indice, nombre in enumerate(nombres):
+                estado = "Turno actual" if nombre.casefold() == actual.casefold() else "Disponible"
+                usuarios_tree.insert(
+                    "", "end", iid=f"usuario-{indice}", values=(nombre, estado)
+                )
+            usuarios_estado.set(
+                f"{len(nombres)} usuario(s). "
+                + (f"Turno actual: {actual}" if actual else "El turno no tiene un representante válido.")
+            )
+
+        def usuario_seleccionado():
+            seleccion = usuarios_tree.selection()
+            if not seleccion:
+                return ""
+            return str(usuarios_tree.item(seleccion[0], "values")[0]).strip()
+
+        def seleccionar_usuario(_evento=None):
+            nombre = usuario_seleccionado()
+            if nombre:
+                usuario_var.set(nombre)
+
+        def validar_usuario_entrada():
+            nombre = limpiar_nombre_representante(usuario_var.get())
+            if not es_representante_valido(nombre):
+                messagebox.showwarning(
+                    "Usuarios",
+                    "Escriba un nombre válido. 'No disponible' no se admite.",
+                    parent=win,
+                )
+                usuario_entry.focus_set()
+                return ""
+            return nombre
+
+        def agregar_usuario():
+            nombre = validar_usuario_entrada()
+            if not nombre:
+                return
+            nombres = cargar_representantes(self.db)
+            if nombre.casefold() in {item.casefold() for item in nombres}:
+                usuarios_estado.set("Ese usuario ya existe; puede seleccionarlo en la lista.")
+                return
+            nombres.append(nombre)
+            if not guardar_catalogo_representantes(nombres):
+                messagebox.showerror("Usuarios", "No se pudo guardar el catálogo.", parent=win)
+                return
+            self.security.audit(
+                "SHIFT_USER_ADDED",
+                actor=self._admin_authorized_actor or self._actor_actual(),
+                success=True,
+                detail=nombre,
+            )
+            usuario_var.set("")
+            cargar_usuarios()
+
+        def aplicar_usuario_turno(nombre):
+            actualizado = actualizar_representante_turno_actual(self.db, nombre)
+            self.security.audit(
+                "SHIFT_USER_CHANGED",
+                actor=self._admin_authorized_actor or self._actor_actual(),
+                success=True,
+                detail=f"turno={actualizado['turno_id']}; representante={nombre}",
+            )
+            self._actualizar_turno_visual_en_vivo()
+            self._invalidar_caches_datos()
+            cargar_usuarios()
+            return actualizado
+
+        def editar_usuario():
+            anterior = usuario_seleccionado()
+            nuevo = validar_usuario_entrada()
+            if not anterior or not nuevo:
+                if not anterior:
+                    messagebox.showwarning(
+                        "Usuarios", "Seleccione el usuario que desea editar.", parent=win
+                    )
+                return
+            nombres = cargar_representantes(self.db)
+            if (
+                nuevo.casefold() != anterior.casefold()
+                and nuevo.casefold() in {item.casefold() for item in nombres}
+            ):
+                messagebox.showwarning(
+                    "Usuarios", "Ya existe otro usuario con ese nombre.", parent=win
+                )
+                return
+            if anterior.casefold() == usuario_actual().casefold():
+                try:
+                    aplicar_usuario_turno(nuevo)
+                except PermissionError:
+                    messagebox.showwarning(
+                        "Excel abierto",
+                        "Cierre el listado de Excel y vuelva a intentarlo. "
+                        "No se modificó el usuario activo.",
+                        parent=win,
+                    )
+                    return
+                except Exception as exc:
+                    APP_LOG.exception("No se pudo editar el usuario del turno")
+                    messagebox.showerror("Usuarios", str(exc), parent=win)
+                    return
+            actualizados = [
+                nuevo if item.casefold() == anterior.casefold() else item
+                for item in nombres
+            ]
+            if not guardar_catalogo_representantes(actualizados):
+                messagebox.showerror("Usuarios", "No se pudo editar el catálogo.", parent=win)
+                return
+            self.security.audit(
+                "SHIFT_USER_RENAMED",
+                actor=self._admin_authorized_actor or self._actor_actual(),
+                success=True,
+                detail=f"{anterior}->{nuevo}",
+            )
+            usuario_var.set(nuevo)
+            cargar_usuarios()
+
+        def eliminar_usuario():
+            nombre = usuario_seleccionado()
+            if not nombre:
+                messagebox.showwarning(
+                    "Usuarios", "Seleccione el usuario que desea eliminar.", parent=win
+                )
+                return
+            if nombre.casefold() == usuario_actual().casefold():
+                messagebox.showwarning(
+                    "Usuarios",
+                    "No puede eliminar el representante del turno actual. "
+                    "Seleccione otro usuario para el turno y vuelva a intentarlo.",
+                    parent=win,
+                )
+                return
+            if not messagebox.askyesno(
+                "Eliminar usuario",
+                f"¿Eliminar '{nombre}' de las sugerencias disponibles?\n\n"
+                "Los turnos históricos no se modificarán.",
+                parent=win,
+            ):
+                return
+            nombres = [
+                item for item in cargar_representantes(self.db)
+                if item.casefold() != nombre.casefold()
+            ]
+            if not guardar_catalogo_representantes(nombres):
+                messagebox.showerror("Usuarios", "No se pudo guardar el catálogo.", parent=win)
+                return
+            self.security.audit(
+                "SHIFT_USER_REMOVED",
+                actor=self._admin_authorized_actor or self._actor_actual(),
+                success=True,
+                detail=nombre,
+            )
+            usuario_var.set("")
+            cargar_usuarios()
+
+        def usar_usuario_actual():
+            nombre = usuario_seleccionado() or validar_usuario_entrada()
+            if not nombre:
+                return
+            if not messagebox.askyesno(
+                "Cambiar representante",
+                f"¿Usar '{nombre}' en el turno actual?\n\n"
+                "Solo cambiarán el encabezado del Excel, los reportes futuros y "
+                "el nombre mostrado en la GUI. Los pacientes no se modificarán.",
+                parent=win,
+            ):
+                return
+            try:
+                aplicar_usuario_turno(nombre)
+                messagebox.showinfo(
+                    "Usuarios",
+                    "Representante actualizado sin modificar pacientes ni atenciones.",
+                    parent=win,
+                )
+            except PermissionError:
+                messagebox.showwarning(
+                    "Excel abierto",
+                    "Cierre el listado de Excel y vuelva a intentarlo. No se cambió el usuario.",
+                    parent=win,
+                )
+            except Exception as exc:
+                APP_LOG.exception("No se pudo cambiar el representante del turno")
+                messagebox.showerror("Usuarios", str(exc), parent=win)
+
+        usuarios_tree.bind("<<TreeviewSelect>>", seleccionar_usuario)
+        usuarios_acciones = tb.Frame(tab_usuarios, style="Card.TFrame")
+        usuarios_acciones.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        tb.Button(
+            usuarios_acciones, text="Añadir", command=agregar_usuario, bootstyle=SUCCESS
+        ).pack(side="left", padx=4)
+        tb.Button(
+            usuarios_acciones, text="Editar", command=editar_usuario, bootstyle=INFO
+        ).pack(side="left", padx=4)
+        tb.Button(
+            usuarios_acciones, text="Eliminar", command=eliminar_usuario, bootstyle=DANGER
+        ).pack(side="left", padx=4)
+        tb.Button(
+            usuarios_acciones,
+            text="Usar en turno actual",
+            command=usar_usuario_actual,
+            bootstyle=PRIMARY,
+        ).pack(side="right", padx=4)
+        cargar_usuarios()
+
+        # ---------------- TAB PREFERENCIAS ----------------
         tab_pref = tb.Frame(notebook, padding=12, style="Card.TFrame")
         notebook.add(tab_pref, text="Preferencias")
         pref = dict(self.app_settings)
@@ -11111,20 +11474,50 @@ class App:
         turno_actual = cargar_turno_config() or {}
         representantes = cargar_representantes(self.db)
         rep_var = tk.StringVar(value=limpiar_nombre_representante(turno_actual.get("representante", "")))
-        rep_entry = tb.Combobox(form_card, textvariable=rep_var, values=representantes, width=34, state="normal")
-        rep_entry.grid(row=0, column=1, sticky="w", pady=6)
+        rep_box = tb.Frame(form_card, style="Card.TFrame")
+        rep_box.grid(row=0, column=1, sticky="ew", pady=6)
+        rep_entry = tb.Entry(rep_box, textvariable=rep_var, width=36)
+        rep_entry.pack(fill="x")
+        similitudes = tk.Listbox(
+            rep_box,
+            height=3,
+            bg="#0B1624",
+            fg="#EAF2FF",
+            selectbackground="#1D6EFF",
+            selectforeground="#FFFFFF",
+            highlightthickness=1,
+            highlightbackground="#254260",
+            relief="flat",
+        )
 
         def filtrar_representantes(_evento=None):
             texto = rep_var.get().strip().casefold()
-            coincidencias = [nombre for nombre in representantes if texto in nombre.casefold()]
-            rep_entry.configure(values=coincidencias[:10] if texto else representantes[:10])
-            if texto and coincidencias:
-                try:
-                    rep_entry.event_generate("<Down>")
-                except Exception:
-                    pass
+            coincidencias = [
+                nombre
+                for nombre in representantes
+                if texto and texto in nombre.casefold()
+                and nombre.casefold() != texto
+            ][:5]
+            similitudes.delete(0, tk.END)
+            for nombre in coincidencias:
+                similitudes.insert(tk.END, nombre)
+            if coincidencias:
+                similitudes.pack(fill="x", pady=(3, 0))
+            else:
+                similitudes.pack_forget()
+
+        def elegir_similitud(_evento=None):
+            seleccion = similitudes.curselection()
+            if not seleccion:
+                return
+            rep_var.set(similitudes.get(seleccion[0]))
+            similitudes.pack_forget()
+            rep_entry.icursor(tk.END)
+            rep_entry.focus_set()
 
         rep_entry.bind("<KeyRelease>", filtrar_representantes)
+        similitudes.bind("<ButtonRelease-1>", elegir_similitud)
+        similitudes.bind("<Return>", elegir_similitud)
 
         tb.Label(form_card, text="Turno:", background="#0E1B2B", foreground="#EAF2FF").grid(row=1, column=0, sticky="w", pady=6)
 
@@ -11209,8 +11602,12 @@ class App:
 
         def aplicar():
             representante = limpiar_nombre_representante(rep_var.get())
-            if not representante or representante.upper() == "NOMBRE DEL REPRESENTANTE":
-                messagebox.showwarning("Representante", "Seleccione o escriba el nombre del representante.", parent=win)
+            if not es_representante_valido(representante):
+                messagebox.showwarning(
+                    "Representante",
+                    "Escriba un nombre válido. 'No disponible' no puede guardarse.",
+                    parent=win,
+                )
                 rep_entry.focus_set()
                 return
 
@@ -11220,6 +11617,58 @@ class App:
 
             momento_cambio = datetime.now()
             turno_saliente = cargar_turno_config(permitir_vencido=True)
+
+            mismo_turno = bool(
+                turno_saliente
+                and turno_saliente.get("fecha_base") == fecha_base
+                and normalizar_turno_codigo(turno_saliente.get("turno_codigo"))
+                == turno_codigo
+            )
+            representante_anterior = limpiar_nombre_representante(
+                (turno_saliente or {}).get("representante", "")
+            )
+            if (
+                mismo_turno
+                and representante.casefold() != representante_anterior.casefold()
+            ):
+                try:
+                    actualizado = actualizar_representante_turno_actual(
+                        self.db, representante
+                    )
+                    self.security.audit(
+                        "SHIFT_USER_CORRECTED",
+                        actor=self._admin_authorized_actor or self._actor_actual(),
+                        success=True,
+                        detail=(
+                            f"turno={actualizado['turno_id']}; "
+                            f"{representante_anterior}->{representante}"
+                        ),
+                    )
+                    self._actualizar_turno_visual_en_vivo()
+                    messagebox.showinfo(
+                        "Representante actualizado",
+                        "Se corrigió el representante en la GUI, el encabezado "
+                        "del Excel y los reportes futuros.\n\n"
+                        "No se reinició el turno ni se modificaron pacientes.",
+                        parent=win,
+                    )
+                    self.turno_win = None
+                    win.destroy()
+                    return
+                except PermissionError:
+                    messagebox.showwarning(
+                        "Excel abierto",
+                        "Cierre el listado de Excel y vuelva a intentarlo. "
+                        "El turno y sus datos permanecen sin cambios.",
+                        parent=win,
+                    )
+                    return
+                except Exception as exc:
+                    APP_LOG.exception("No se pudo corregir el representante del turno")
+                    messagebox.showerror(
+                        "Representante", str(exc), parent=win
+                    )
+                    return
 
             try:
                 self.db.backup_manager.create(
