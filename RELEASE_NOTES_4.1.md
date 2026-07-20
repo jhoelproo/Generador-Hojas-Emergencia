@@ -1,4 +1,12 @@
-# Generador de Hojas de Emergencia 4.1.8
+# Generador de Hojas de Emergencia 4.1.9
+
+- La sección Usuarios presenta un panel moderno dividido entre el catálogo y la corrección independiente del turno actual.
+- Añadir y editar usuarios se realiza mediante ventanas emergentes; eliminar permanece como acción directa y confirmada.
+- Corregir al representante del turno actual no imprime, no cierra el turno y no modifica pacientes, atenciones, numeración ni hora de inicio.
+- La corrección actualiza únicamente la GUI, el encabezado del Excel y el nombre usado en los reportes PDF posteriores.
+- Se eliminó la recuperación automática que podía crear un turno al iniciar desde un Excel existente.
+- Si hay pacientes en Excel pero falta un turno configurado, el listado se conserva intacto y se solicita una confirmación manual.
+- Ningún cambio de turno se ejecuta automáticamente durante sábado, domingo o al cruzar un horario.
 
 - El representante del turno se escribe libremente; las coincidencias aparecen debajo como sugerencias y nunca bloquean la escritura.
 - Los valores “No disponible”, “No configurado” y otros marcadores equivalentes ya no pueden guardarse como representantes.
