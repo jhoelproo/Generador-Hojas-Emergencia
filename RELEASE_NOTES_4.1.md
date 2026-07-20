@@ -1,4 +1,10 @@
-# Generador de Hojas de Emergencia 4.1.7
+# Generador de Hojas de Emergencia 4.1.8
+
+- El representante del turno se escribe libremente; las coincidencias aparecen debajo como sugerencias y nunca bloquean la escritura.
+- Los valores “No disponible”, “No configurado” y otros marcadores equivalentes ya no pueden guardarse como representantes.
+- Configuración interna incorpora la sección Usuarios entre Respaldos y Preferencias para añadir, editar, eliminar o seleccionar representantes.
+- Corregir el representante del turno actual solo actualiza la GUI, el encabezado del Excel y los reportes futuros; no reinicia el turno ni modifica pacientes o atenciones.
+- Los usuarios eliminados del catálogo no reaparecen por existir en turnos históricos.
 
 - Al editar una atención, el nombre y el sexo se guardan en el registro y el PDF archivado se regenera con los datos nuevos.
 - El formulario principal inicia y se limpia con sexo Femenino seleccionado por defecto.
